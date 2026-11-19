@@ -19,7 +19,7 @@ FEATURES = ["sensor_features:net_inflow", "sensor_features:pressure_mean", "sens
 
 # --- offline: build a small training set
 entity_df = pd.DataFrame({
-    "scenario_id": ["base_000", "base_000", "base_020"],
+    "scenario_id": ["winter_000", "winter_000", "winter_020"],
     "event_timestamp": pd.to_datetime(["2026-01-02 06:00", "2026-01-02 18:00", "2026-01-03 03:00"], utc=True),
 })
 training = store.get_historical_features(entity_df=entity_df, features=FEATURES).to_df()
@@ -28,6 +28,6 @@ print(training.to_string(index=False))
 
 # --- online: what the API would see right now
 online = store.get_online_features(features=FEATURES,
-                                   entity_rows=[{"scenario_id": "base_000"}, {"scenario_id": "base_020"}]).to_df()
+                                   entity_rows=[{"scenario_id": "winter_000"}, {"scenario_id": "winter_020"}]).to_df()
 print("\nOnline features (serving):")
 print(online.to_string(index=False))

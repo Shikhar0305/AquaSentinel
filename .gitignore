@@ -6,7 +6,7 @@ venv/
 
 # data and models are versioned with DVC / MLflow, not git
 /data/raw/
-/data/processed/
+/data/incoming/
 /data/snapshots/
 /data/features/
 /models/
@@ -19,6 +19,5 @@ mlflow.db
 /logs/
 /reports/
 /metrics/drift.json
-/metrics/last_cycle.json
 feature_repo/data/
 .env

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AquaSentinel – leak monitoring</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%230f6fa8' d='M12 2.5c3.6 4.6 6.5 8.3 6.5 11.7a6.5 6.5 0 0 1-13 0C5.5 10.8 8.4 7.1 12 2.5z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="vendor/chart.umd.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+
+<!-- ============ sign in ============ -->
+<div id="signin" class="signin" hidden>
+  <form class="signin-panel" id="signin-form">
+    <h1>AquaSentinel</h1>
+    <p>Pick a role to sign in. Each role can do different things, so you can see the access control working.</p>
+    <div class="roles">
+      <button type="button" class="role" data-key="admin-dev-key">
+        <strong>Admin</strong><span>Everything, plus promote, roll back and retrain models</span>
+      </button>
+      <button type="button" class="role" data-key="operator-dev-key">
+        <strong>Operator</strong><span>Watch the network and replay sensor data</span>
+      </button>
+      <button type="button" class="role" data-key="viewer-dev-key">
+        <strong>Viewer</strong><span>Read only: can look but not run predictions</span>
+      </button>
+    </div>
+    <label for="custom-key">Or enter your own API key</label>
+    <div class="key-row">
+      <input id="custom-key" type="password" autocomplete="off" placeholder="API key">
+      <button type="submit" class="btn">Sign in</button>
+    </div>
+    <p class="error" id="signin-error" role="alert"></p>
+  </form>
+</div>
+
+<!-- ============ header ============ -->
+<header class="topbar">
+  <a class="brand" href="#monitor">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5c3.6 4.6 6.5 8.3 6.5 11.7a6.5 6.5 0 0 1-13 0C5.5 10.8 8.4 7.1 12 2.5z"/></svg>
+    AquaSentinel
+  </a>
+  <nav class="tabs" aria-label="Sections">
+    <a href="#monitor" data-view="monitor">Monitor</a>
+    <a href="#models" data-view="models">Models</a>
+    <a href="#drift" data-view="drift">Data drift</a>
+    <a href="#operations" data-view="operations">Operations</a>
+  </nav>
+  <div class="who">
+    <span id="api-state" class="dot" title="API status"></span>
+    <span id="model-chip">model –</span>
+    <span id="role-chip" class="role-chip">–</span>
+    <button class="link" id="signout">Sign out</button>
+  </div>
+</header>
+
+<main>
+
+<!-- ============ monitor ============ -->
+<section id="view-monitor" class="view">
+  <div class="monitor">
+    <div class="map-wrap">
+      <div class="map-head">
+        <div>
+          <h2>Net3 distribution network</h2>
+          <p class="muted">97 junctions, 2 sources, 3 tanks. Diamonds are pressure sensors.</p>
+        </div>
+        <div class="clock" id="clock" aria-live="off">–</div>
+      </div>
+      <svg id="map" role="img" aria-label="Map of the water network"></svg>
+      <div class="legend">
+        <span><i class="lg pipe"></i>pipe</span>
+        <span><i class="lg sensor"></i>pressure sensor</span>
+        <span><i class="lg source"></i>source / tank</span>
+        <span><i class="lg suspect"></i>suspected leak area</span>
+        <span id="truth-legend" hidden><i class="lg truth"></i>actual leak (simulation)</span>
+      </div>
+    </div>
+
+    <aside class="rail">
+      <div id="status" class="status normal">
+        <p class="status-word" id="status-word">Waiting</p>
+        <p class="status-text" id="status-text">Choose a scenario and press Replay to stream its sensor readings through the model.</p>
+      </div>
+
+      <div class="controls">
+        <div class="field">
+          <label for="season">Data</label>
+          <select id="season">
+            <option value="winter">Winter (training season)</option>
+            <option value="summer">Summer (30% more demand)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="scenario">Scenario</label>
+          <select id="scenario"></select>
+        </div>
+        <div class="field">
+          <label for="speed">Speed</label>
+          <select id="speed">
+            <option value="250">Slow</option>
+            <option value="80" selected>Normal</option>
+            <option value="20">Fast</option>
+          </select>
+        </div>
+        <div class="buttons">
+          <button class="btn primary" id="play">Replay</button>
+          <button class="btn" id="stop" disabled>Stop</button>
+        </div>
+        <label class="check"><input type="checkbox" id="show-truth"> Show where the leak really is</label>
+      </div>
+
+      <dl class="readout">
+        <div><dt>Extra inflow</dt><dd id="ro-inflow">–</dd></div>
+        <div><dt>Anomaly score</dt><dd id="ro-score">–</dd></div>
+        <div><dt>Readings</dt><dd id="ro-count">–</dd></div>
+        <div><dt>Alerts</dt><dd id="ro-alerts">–</dd></div>
+      </dl>
+    </aside>
+  </div>
+
+  <div class="chart-block">
+    <div class="chart-head">
+      <h3>Anomaly score and extra inflow</h3>
+      <p class="muted">The model raises an alert after 3 readings in a row above the threshold. The dotted line marks when the leak started.</p>
+    </div>
+    <div class="chart-box"><canvas id="score-chart"></canvas></div>
+  </div>
+</section>
+
+<!-- ============ models ============ -->
+<section id="view-models" class="view" hidden>
+  <div class="page-head">
+    <h2>Models</h2>
+    <p class="muted">Every trained model is a version in the MLflow registry. The champion is the one answering requests.</p>
+  </div>
+  <div class="models">
+    <div class="champion" id="champion"></div>
+    <div class="admin-box admin-only">
+      <h3>Admin actions</h3>
+      <p class="muted">Run the same steps the hourly Airflow job runs, or change the production model by hand.</p>
+      <button class="btn primary" id="run-cycle">Check new data for drift</button>
+      <div class="key-row">
+        <input id="promote-version" type="number" min="1" placeholder="Version">
+        <button class="btn" id="promote">Promote</button>
+      </div>
+      <button class="btn danger" id="rollback">Roll back to previous model</button>
+      <p class="action-result" id="action-result" role="status"></p>
+    </div>
+  </div>
+  <h3 class="section-title">Lineage</h3>
+  <p class="muted">Who changed the production model, when, and which data each version was trained on.</p>
+  <ol class="timeline" id="lineage"></ol>
+</section>
+
+<!-- ============ drift ============ -->
+<section id="view-drift" class="view" hidden>
+  <div class="page-head">
+    <h2>Data drift</h2>
+    <p class="muted" id="drift-summary">No drift check has run yet.</p>
+  </div>
+  <div class="drift">
+    <div class="chart-box tall"><canvas id="psi-chart"></canvas></div>
+    <div class="drift-side">
+      <p class="big-number" id="drift-share">–</p>
+      <p class="muted">of sensors changed more than the PSI limit of <span id="psi-limit">0.5</span>. Retraining starts when it reaches half.</p>
+      <p id="drift-action" class="drift-action"></p>
+      <a class="btn" href="/reports/drift" target="_blank" rel="noopener">Open full Evidently report</a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ operations ============ -->
+<section id="view-operations" class="view" hidden>
+  <div class="page-head">
+    <h2>Operations</h2>
+    <p class="muted">What the watchdog did on its own, API traffic, and the audit log of admin actions.</p>
+  </div>
+  <h3 class="section-title">Watchdog incidents</h3>
+  <table class="table" id="incidents"><thead><tr><th>Time</th><th>What happened</th><th>Details</th></tr></thead><tbody></tbody></table>
+  <h3 class="section-title">API traffic (last hour)</h3>
+  <div class="chart-box"><canvas id="traffic-chart"></canvas></div>
+  <h3 class="section-title">Audit log</h3>
+  <table class="table" id="audit"><thead><tr><th>Time</th><th>Role</th><th>Action</th><th>Details</th></tr></thead><tbody></tbody></table>
+</section>
+
+</main>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

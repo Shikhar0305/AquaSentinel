@@ -1,52 +1,69 @@
 """
-AquaSentinel REST API (FastAPI).
+AquaSentinel API + website.
 
-Run locally:   uvicorn api.main:app --reload --port 8000
-Docs:          http://localhost:8000/docs
+    uvicorn api.main:app --port 8000
 
-Every request is logged to logs/api.log (JSON lines). The watchdog and the log
-anomaly detector in ops/ read that file. Prometheus scrapes /metrics.
+    http://localhost:8000        website (control room)
+    http://localhost:8000/docs   API documentation
+    http://localhost:8000/metrics  Prometheus metrics
+
+Every request is written to logs/api.log; the watchdog and the log anomaly
+detector in ops/ read it.
 """
 import json
 import os
 import time
 from datetime import datetime
+from functools import lru_cache
 from typing import Dict, List
 
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, Field
 
-from api.model_service import ModelService
-from api.security import audit, require_role
-from src.utils import LOGS_DIR, METRICS_DIR, get_logger, load_params, sensor_columns
+from api.auth import audit, current_role, require
+from api.models import ModelStore
+from src import registry
+from src.config import LOGS, METRICS, ROOT, SUMMER_FILE, TRAIN_FILE, load_params, sensor_columns
 
-log = get_logger("api")
 PARAMS = load_params()
 SENSORS = sensor_columns(PARAMS)
 
-app = FastAPI(title="AquaSentinel API", version="1.0",
+app = FastAPI(title="AquaSentinel API", version="2.0",
               description="Leak detection for water pipelines from pressure and flow sensors.")
-service = ModelService()
+store = ModelStore()
 
-# ---------------- Prometheus metrics ----------------
+# ------------------------------------------------------------ Prometheus metrics
 REQUESTS = Counter("aqua_requests_total", "HTTP requests", ["path", "status"])
-LATENCY = Histogram("aqua_request_latency_seconds", "Request latency", ["path"],
-                    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5))
+LATENCY = Histogram("aqua_request_latency_seconds", "Request latency", ["path"])
 PREDICTIONS = Counter("aqua_predictions_total", "Readings scored", ["result"])
-LEAK_ALERTS = Counter("aqua_leak_alerts_total", "Leak alerts raised")
-SCORE = Histogram("aqua_anomaly_score", "Anomaly score of the latest reading",
-                  buckets=(0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8))
-SHADOW_DISAGREE = Counter("aqua_shadow_disagreements_total", "Champion and challenger disagree")
-MODEL_VERSION = Gauge("aqua_model_version", "Model version loaded", ["role"])
+ALERTS = Counter("aqua_leak_alerts_total", "Leak alerts raised")
+SHADOW_DIFF = Counter("aqua_shadow_disagreements_total", "Champion and challenger disagree")
+VERSION = Gauge("aqua_model_version", "Model version in production")
 ANOMALY_RATE = Gauge("aqua_recent_anomaly_rate", "Share of anomalous readings in the last 500")
-DRIFT_SHARE = Gauge("aqua_drift_share", "Share of sensor columns with drift (last check)")
-DRIFT_FLAG = Gauge("aqua_drift_detected", "1 if the last drift check found drift")
+DRIFT_SHARE = Gauge("aqua_drift_share", "Share of sensors that drifted in the last check")
 
 
-# ---------------- request / response models ----------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    seconds = time.perf_counter() - start
+    path = request.url.path
+    if path.startswith(("/predict", "/model", "/monitoring", "/api", "/health")):
+        REQUESTS.labels(path, str(response.status_code)).inc()
+        LATENCY.labels(path).observe(seconds)
+        with open(LOGS / "api.log", "a") as f:
+            f.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"), "method": request.method,
+                                "path": path, "status": response.status_code,
+                                "latency_ms": round(seconds * 1000, 2)}) + "\n")
+    return response
+
+
+# ------------------------------------------------------------ prediction
 class Reading(BaseModel):
     timestamp: datetime
     sensors: Dict[str, float] = Field(..., examples=[{"P_15": 27.5, "F_60": 830.2}])
@@ -54,175 +71,197 @@ class Reading(BaseModel):
 
 class PredictRequest(BaseModel):
     readings: List[Reading] = Field(..., min_length=1, max_length=2000,
-                                    description="Recent readings in time order. Send at least the "
-                                                "last 12 (3 hours) so the smoothing windows work.")
+                                    description="Recent readings in time order (send the last 12 or more).")
 
 
-class ReadingResult(BaseModel):
-    timestamp: datetime
-    anomaly_score: float
-    is_anomaly: bool
-    leak_alert: bool
-    extra_inflow_lps: float
-    suspected_area: str
-
-
-class PredictResponse(BaseModel):
-    model_version: int
-    served_by: str
-    threshold: float
-    leak_alert: bool
-    results: List[ReadingResult]
-
-
-# ---------------- logging middleware ----------------
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time.perf_counter()
-    status = 500
-    try:
-        response = await call_next(request)
-        status = response.status_code
-        return response
-    finally:
-        elapsed = time.perf_counter() - start
-        path = request.url.path
-        if path != "/metrics":
-            REQUESTS.labels(path, str(status)).inc()
-            LATENCY.labels(path).observe(elapsed)
-            with open(LOGS_DIR / "api.log", "a") as f:
-                f.write(json.dumps({"time": datetime.now().isoformat(timespec="seconds"),
-                                    "method": request.method, "path": path, "status": status,
-                                    "latency_ms": round(elapsed * 1000, 2)}) + "\n")
-
-
-def to_dataframe(readings):
-    rows = []
-    for r in readings:
-        missing = [s for s in SENSORS if s not in r.sensors]
-        if missing:
-            raise HTTPException(status_code=422, detail=f"missing sensors: {missing}")
-        rows.append({"timestamp": r.timestamp, **{s: r.sensors[s] for s in SENSORS}})
-    return pd.DataFrame(rows)
-
-
-# ---------------- endpoints ----------------
 @app.get("/health")
 def health():
-    ok = service.champion is not None
-    return {"status": "ok" if ok else "no_model",
-            "model_version": service.champion.version if ok else None}
+    store.reload_if_changed()
+    return {"status": "ok" if store.champion else "no_model",
+            "model_version": store.champion.version if store.champion else None}
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest, role: str = Depends(require_role("operator"))):
-    service.reload_if_changed()
-    if service.champion is None:
-        raise HTTPException(status_code=503, detail="no model loaded")
+@app.post("/predict")
+def predict(req: PredictRequest, role: str = Depends(require("operator"))):
+    store.reload_if_changed()
+    if store.champion is None:
+        raise HTTPException(503, "No model in production yet. Run: python -m src.train")
+    rows = []
+    for r in req.readings:
+        missing = [s for s in SENSORS if s not in r.sensors]
+        if missing:
+            raise HTTPException(422, f"missing sensors: {missing}")
+        rows.append({"timestamp": r.timestamp, **r.sensors})
+    df = pd.DataFrame(rows)
 
-    df = to_dataframe(req.readings)
-    chosen, served_by = service.pick_model()
-    out = service.score(chosen, df)
+    chosen, served_by = store.pick()
+    out = chosen.model.predict_details(df)
+    if store.shadow and store.challenger and chosen is store.champion:
+        shadow = store.challenger.model.predict_details(df)
+        if shadow["is_anomaly"].iloc[-1] != out["is_anomaly"].iloc[-1]:
+            SHADOW_DIFF.inc()
 
-    # shadow deployment: run the challenger silently and compare
-    if service.shadow_mode and service.challenger is not None and chosen is service.champion:
-        shadow = service.score(service.challenger, df)
-        if shadow["flags"][-1] != out["flags"][-1]:
-            SHADOW_DISAGREE.inc()
+    last = out.iloc[-1]
+    store.recent.append(int(last["is_anomaly"]))
+    PREDICTIONS.labels("anomaly" if last["is_anomaly"] else "normal").inc()
+    if last["leak_alert"]:
+        ALERTS.inc()
 
-    last_flag = int(out["flags"][-1])
-    service.recent_flags.append(last_flag)
-    PREDICTIONS.labels("anomaly" if last_flag else "normal").inc()
-    SCORE.observe(float(out["scores"][-1]))
-    leak_alert = bool(out["alerts"][-1])
-    if leak_alert:
-        LEAK_ALERTS.inc()
-
-    results = [
-        ReadingResult(timestamp=ts, anomaly_score=round(float(s), 4), is_anomaly=bool(f),
-                      leak_alert=bool(a), extra_inflow_lps=round(float(e), 2), suspected_area=str(ar))
-        for ts, s, f, a, e, ar in zip(df["timestamp"], out["scores"], out["flags"],
-                                      out["alerts"], out["extra_inflow"], out["area"])
-    ]
-    return PredictResponse(model_version=chosen.version, served_by=served_by,
-                           threshold=round(out["threshold"], 4), leak_alert=leak_alert, results=results)
+    out["extra_inflow"] = out["extra_inflow"].round(2)
+    out["anomaly_score"] = out["anomaly_score"].round(4)
+    out.insert(0, "timestamp", df["timestamp"].astype(str))
+    return {"model_version": chosen.version, "served_by": served_by,
+            "threshold": round(chosen.model.threshold_, 4), "leak_alert": bool(last["leak_alert"]),
+            "results": out.to_dict(orient="records")}
 
 
+# ------------------------------------------------------------ models and monitoring
 @app.get("/model/info")
-def model_info(role: str = Depends(require_role("viewer"))):
-    service.reload_if_changed()
-    return {
-        "champion": service.champion.meta if service.champion else None,
-        "challenger": service.challenger.meta if service.challenger else None,
-        "shadow_mode": service.shadow_mode,
-        "canary_percent": service.canary_percent,
-        "loaded_at": service.loaded_at,
-        "recent_anomaly_rate": round(service.anomaly_rate(), 4),
-        "recent_predictions": len(service.recent_flags),
-    }
+def model_info(role: str = Depends(require("viewer"))):
+    store.reload_if_changed()
+    return {"champion": store.champion.info if store.champion else None,
+            "challenger": store.challenger.info if store.challenger else None,
+            "shadow_mode": store.shadow, "canary_percent": store.canary,
+            "recent_anomaly_rate": round(store.anomaly_rate(), 4), "recent_predictions": len(store.recent)}
 
 
 @app.get("/model/lineage")
-def model_lineage(role: str = Depends(require_role("viewer"))):
-    from src.registry import read_lineage
-    return read_lineage()
+def model_lineage(role: str = Depends(require("viewer"))):
+    return registry.read_lineage()
 
 
 @app.get("/monitoring/drift")
-def drift_status(role: str = Depends(require_role("viewer"))):
-    path = METRICS_DIR / "drift.json"
-    if not path.exists():
-        return {"status": "no drift check has run yet"}
-    return json.loads(path.read_text())
+def drift(role: str = Depends(require("viewer"))):
+    path = METRICS / "drift.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+@app.post("/monitoring/run")
+def run_monitoring(role: str = Depends(require("admin"))):
+    """Ingest the next batch of data, check drift and retrain if needed (same as python -m src.monitor)."""
+    from src.monitor import run_cycle
+    result = run_cycle()
+    store.reload_if_changed()
+    audit(role, "monitoring cycle", result.get("action", ""))
+    return result
 
 
 @app.post("/model/reload")
-def reload_model(role: str = Depends(require_role("admin"))):
-    service.reload()
-    audit(role, "reload", f"v{service.champion.version if service.champion else None}")
-    return {"loaded_version": service.champion.version if service.champion else None}
-
-
-@app.post("/model/rollback")
-def rollback_model(reason: str = "manual rollback from API", role: str = Depends(require_role("admin"))):
-    from src.registry import rollback
-    try:
-        version = rollback(user=f"api:{role}", reason=reason)
-    except Exception as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    service.reload()
-    audit(role, "rollback", f"to v{version}: {reason}")
-    return {"rolled_back_to": version}
+def reload_model(role: str = Depends(require("admin"))):
+    store.reload()
+    audit(role, "reload")
+    return {"version": store.champion.version if store.champion else None}
 
 
 @app.post("/model/promote/{version}")
-def promote_model(version: int, role: str = Depends(require_role("admin"))):
-    from src.registry import promote
-    promote(version, user=f"api:{role}", reason="manual promote from API")
-    service.reload()
+def promote(version: int, role: str = Depends(require("admin"))):
+    registry.promote(version, f"api:{role}", "manual promote")
+    store.reload()
     audit(role, "promote", f"v{version}")
     return {"champion": version}
 
 
-@app.post("/admin/crash", include_in_schema=os.getenv("ENABLE_CHAOS", "false") == "true")
-def crash(role: str = Depends(require_role("admin"))):
-    """Demo only: kills the API process so the watchdog can show auto-restart."""
-    if os.getenv("ENABLE_CHAOS", "false") != "true":
-        raise HTTPException(status_code=404)
-    audit(role, "crash", "chaos test")
+@app.post("/model/rollback")
+def rollback(reason: str = "manual rollback", role: str = Depends(require("admin"))):
+    try:
+        version = registry.rollback(f"api:{role}", reason)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    store.reload()
+    audit(role, "rollback", f"to v{version}: {reason}")
+    return {"rolled_back_to": version}
+
+
+@app.post("/admin/crash", include_in_schema=False)
+def crash(role: str = Depends(require("admin"))):
+    """Demo only (ENABLE_CHAOS=true): kills the API so the watchdog can restart it."""
+    if os.getenv("ENABLE_CHAOS") != "true":
+        raise HTTPException(404)
+    audit(role, "crash test")
     os._exit(1)
 
 
 @app.get("/metrics")
 def metrics():
-    if service.champion:
-        MODEL_VERSION.labels("champion").set(service.champion.version)
-    if service.challenger:
-        MODEL_VERSION.labels("challenger").set(service.challenger.version)
-    ANOMALY_RATE.set(service.anomaly_rate())
-    drift_file = METRICS_DIR / "drift.json"
+    VERSION.set(store.champion.version if store.champion else 0)
+    ANOMALY_RATE.set(store.anomaly_rate())
+    drift_file = METRICS / "drift.json"
     if drift_file.exists():
-        d = json.loads(drift_file.read_text())
-        DRIFT_SHARE.set(d.get("drift_share", 0))
-        DRIFT_FLAG.set(1 if d.get("drift_detected") else 0)
+        DRIFT_SHARE.set(json.loads(drift_file.read_text()).get("drift_share", 0))
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# ------------------------------------------------------------ data for the website
+@lru_cache
+def load_season(season):
+    path = TRAIN_FILE if season == "winter" else SUMMER_FILE
+    if not path.exists():
+        raise HTTPException(404, "No data yet. Run: python -m src.data simulate")
+    return pd.read_csv(path)
+
+
+@app.get("/api/me")
+def me(role: str = Depends(current_role)):
+    return {"role": role}
+
+
+@app.get("/api/network")
+@lru_cache
+def network():
+    import wntr
+    wn = wntr.network.WaterNetworkModel(PARAMS["simulation"]["network"])
+    return {"nodes": {n: wn.get_node(n).coordinates for n in wn.node_name_list},
+            "pipes": [[link.start_node_name, link.end_node_name] for _, link in wn.links()],
+            "pressure_sensors": PARAMS["sensors"]["pressure"],
+            "sources": wn.reservoir_name_list, "tanks": wn.tank_name_list}
+
+
+@app.get("/api/scenarios")
+def scenarios(season: str = "winter", role: str = Depends(require("viewer"))):
+    df = load_season(season)
+    info = df.groupby("scenario_id").agg(leak=("leak", "max"), node=("leak_node", "first"),
+                                         area=("leak_area", "first")).reset_index()
+    info["node"] = info["node"].fillna("").astype(str).str.replace(r"\.0$", "", regex=True)
+    return info.to_dict(orient="records")
+
+
+@app.get("/api/scenarios/{scenario_id}")
+def scenario(scenario_id: str, season: str = "winter", role: str = Depends(require("viewer"))):
+    df = load_season(season)
+    rows = df[df["scenario_id"] == scenario_id]
+    if rows.empty:
+        raise HTTPException(404, "unknown scenario")
+    return {"timestamps": rows["timestamp"].tolist(), "leak": rows["leak"].tolist(),
+            "sensors": {s: rows[s].round(3).tolist() for s in SENSORS}}
+
+
+@app.get("/reports/drift", include_in_schema=False)
+def drift_report():
+    """Full Evidently report (opened in a new tab, so no API key header)."""
+    path = ROOT / "reports" / "drift_report.html"
+    if not path.exists():
+        raise HTTPException(404, "No drift report yet. Run a monitoring cycle first.")
+    return FileResponse(path)
+
+
+@app.get("/api/operations")
+def operations(role: str = Depends(require("viewer"))):
+    def read(path, last=200):
+        if not path.exists():
+            return []
+        return [json.loads(x) for x in path.read_text().splitlines()[-last:] if x.strip()]
+    requests_log = read(LOGS / "api.log", 3000)
+    per_minute = {}
+    for r in requests_log:
+        minute = r["time"][:16]
+        m = per_minute.setdefault(minute, {"minute": minute, "requests": 0, "errors": 0, "latency": 0.0})
+        m["requests"] += 1
+        m["errors"] += r["status"] >= 400
+        m["latency"] += r["latency_ms"]
+    traffic = [{**m, "latency": round(m["latency"] / m["requests"], 1)} for m in per_minute.values()][-60:]
+    return {"incidents": read(LOGS / "incidents.jsonl")[::-1], "audit": read(LOGS / "audit.log", 50)[::-1],
+            "traffic": traffic}
+
+
+# the website itself (must be mounted last so it doesn't hide the API routes)
+app.mount("/", StaticFiles(directory=ROOT / "web", html=True), name="web")

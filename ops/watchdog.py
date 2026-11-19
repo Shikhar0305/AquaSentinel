@@ -6,7 +6,7 @@ Every few seconds it:
 2. Reads /model/info. If the share of readings flagged as anomalous is far too
    high, the model is probably broken (or the data changed), so it ROLLS BACK
    to the previous model version through the admin API.
-Every action is written to logs/incidents.jsonl so the dashboard can show it.
+Every action is written to logs/incidents.jsonl so the website can show it.
 
 Two ways to run it:
     # watchdog starts and supervises the API itself (local development)
@@ -25,10 +25,10 @@ from datetime import datetime
 
 import requests
 
-from src.utils import LOGS_DIR, get_logger
+from src.config import LOGS, get_logger
 
 log = get_logger("watchdog")
-INCIDENTS = LOGS_DIR / "incidents.jsonl"
+INCIDENTS = LOGS / "incidents.jsonl"
 
 
 def record(kind, detail):

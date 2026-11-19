@@ -18,8 +18,6 @@ sensor_source = FileSource(
     created_timestamp_column="created",
 )
 
-PRESSURE_SENSORS = ["15", "35", "123", "149", "173", "203", "247", "255"]
-
 sensor_features = FeatureView(
     name="sensor_features",
     entities=[zone],
@@ -28,7 +26,7 @@ sensor_features = FeatureView(
         Field(name="net_inflow", dtype=Float32, description="Total inflow from sources and tanks (L/s)"),
         Field(name="pressure_mean", dtype=Float32, description="Average of the pressure sensors (m)"),
         Field(name="pressure_min", dtype=Float32, description="Lowest pressure sensor reading (m)"),
-    ] + [Field(name=f"P_{n}", dtype=Float32) for n in PRESSURE_SENSORS],
+    ],
     source=sensor_source,
     online=True,
     tags={"team": "aquasentinel"},

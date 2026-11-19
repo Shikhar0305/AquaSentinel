@@ -30,10 +30,10 @@ groups:
           summary: "More than half of recent readings flagged - model or data problem"
 
       - alert: DataDriftDetected
-        expr: aqua_drift_detected == 1
+        expr: aqua_drift_share >= 0.5
         labels: {severity: warning}
         annotations:
-          summary: "Sensor data drift detected (share {{ $value }}) - retraining should start"
+          summary: "Half or more of the sensors drifted - retraining should start"
 
       - alert: HighErrorRate
         expr: sum(rate(aqua_requests_total{status=~"5.."}[5m])) / sum(rate(aqua_requests_total[5m])) > 0.05

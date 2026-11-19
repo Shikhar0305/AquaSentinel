@@ -1,150 +1,117 @@
 """
-Step 2 - Train, evaluate and register the leak detector.
+Train, evaluate and register the leak detector with MLflow.
 
-1. Split scenarios into train / test.
-2. Fit the LeakDetector on NORMAL readings from the train scenarios only.
-3. Evaluate on the unseen test scenarios.
-4. Log params, metrics, plots and the model to MLflow and register a new version.
-5. Promote it to "champion" if it is at least as good as the current champion,
-   otherwise keep it as "challenger".
+1. Split whole scenarios into train and test.
+2. Fit the model on NORMAL readings of the train scenarios.
+3. Evaluate on the test scenarios.
+4. Log everything to MLflow and register a new model version.
+5. Make it the "champion" (production model) if it beats the current one.
 
-Usage:
-    python -m src.train                                   # uses data/raw/sensor_data.csv
-    python -m src.train --data data/raw/drift_data.csv    # used by retraining
+    python -m src.train
 """
-import argparse
-from pathlib import Path
+import sys
 
-import matplotlib
+import mlflow
+import mlflow.sklearn
+import numpy as np
+import pandas as pd
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import mlflow  # noqa: E402
-import mlflow.sklearn  # noqa: E402
-import pandas as pd  # noqa: E402
-
-from src import registry  # noqa: E402
-from src.evaluate import evaluate, normal_rows, split_by_scenario  # noqa: E402
-from src.model import build_model  # noqa: E402
-from src.utils import (DATA_DIR, METRICS_DIR, REPORTS_DIR, ROOT, file_md5, get_logger,  # noqa: E402
-                       get_tracking_uri, load_params, save_json)
+from src import registry
+from src.config import METRICS, TRAIN_FILE, file_md5, get_logger, load_params, relative, save_json, tracking_uri
+from src.model import build_model
 
 log = get_logger("train")
 
 
-def plot_scenario(model, df, path):
-    """Anomaly score of one leak scenario - quick visual sanity check."""
+def split_by_scenario(df, test_size=0.3, seed=42):
+    """Whole scenarios go to train or test, never half and half."""
+    rng = np.random.default_rng(seed)
     leak_ids = df.loc[df["leak"] == 1, "scenario_id"].unique()
-    g = df[df["scenario_id"] == leak_ids[0]]
-    scores = model.anomaly_score(g)
-    fig, ax = plt.subplots(figsize=(10, 3.5))
-    ax.plot(pd.to_datetime(g["timestamp"]), scores, label="anomaly score", color="#1f77b4")
-    ax.axhline(model.threshold_, color="red", ls="--", label="threshold")
-    start = pd.to_datetime(g.loc[g["leak"] == 1, "timestamp"].iloc[0])
-    ax.axvline(start, color="orange", label="leak starts")
-    ax.set_title(f"Scenario {leak_ids[0]} (leak at junction {g['leak_node'].iloc[0]})")
-    ax.legend(loc="upper left")
-    fig.tight_layout()
-    fig.savefig(path, dpi=110)
-    plt.close(fig)
+    normal_ids = np.setdiff1d(df["scenario_id"].unique(), leak_ids)
+    test_ids = []
+    for ids in (normal_ids, leak_ids):   # keep both kinds in the test set
+        ids = rng.permutation(ids)
+        test_ids += list(ids[:max(1, round(len(ids) * test_size))])
+    is_test = df["scenario_id"].isin(test_ids)
+    return df[~is_test], df[is_test]
 
 
-def relative_path(path):
-    """Store paths relative to the project so lineage works on any machine."""
-    try:
-        return str(Path(path).resolve().relative_to(ROOT))
-    except ValueError:
-        return str(path)
+def evaluate(model, df):
+    out = model.predict_details(df)
+    y = df["leak"].values
+    detected, delays = [], []
+    for _, g in df.assign(alert=out["leak_alert"].values).groupby("scenario_id"):
+        if g["leak"].any():
+            labels, alerts = g["leak"].values, g["alert"].values
+            start = labels.argmax()
+            hits = np.where((labels == 1) & (alerts == 1))[0]
+            detected.append(len(hits) > 0)
+            if len(hits):
+                delays.append((hits[0] - start) * 15)   # minutes
+    return {
+        "precision": round(precision_score(y, out["is_anomaly"], zero_division=0), 4),
+        "recall": round(recall_score(y, out["is_anomaly"], zero_division=0), 4),
+        "f1": round(f1_score(y, out["is_anomaly"], zero_division=0), 4),
+        "roc_auc": round(roc_auc_score(y, out["anomaly_score"]), 4),
+        "leaks_detected": round(float(np.mean(detected)), 4),
+        "detection_delay_min": float(np.median(delays)) if delays else -1.0,
+        "false_alarm_rate": round(float(out["leak_alert"].values[y == 0].mean()), 4),
+    }
 
 
-def train(data_path, run_name="train", user="pipeline"):
+def score_for_promotion(metrics, params):
+    """ROC-AUC, but a model that raises too many false alarms is useless (score 0)."""
+    if metrics["false_alarm_rate"] > params["monitoring"]["max_false_alarms"]:
+        return 0.0
+    return metrics["roc_auc"]
+
+
+def train(data_file=TRAIN_FILE, user="pipeline"):
     params = load_params()
-    mlflow.set_tracking_uri(get_tracking_uri())
+    mlflow.set_tracking_uri(tracking_uri())
     mlflow.set_experiment("aquasentinel")
 
-    df = pd.read_csv(data_path)
-    data_path = relative_path(data_path)
-    train_df, test_df = split_by_scenario(df, params["model"]["test_size"], params["model"]["random_state"])
-    log.info("train scenarios: %d, test scenarios: %d",
-             train_df["scenario_id"].nunique(), test_df["scenario_id"].nunique())
+    df = pd.read_csv(data_file)
+    train_df, test_df = split_by_scenario(df, params["model"]["test_size"], params["model"]["seed"])
+    model = build_model(params).fit(train_df[train_df["leak"] == 0])
+    metrics = evaluate(model, test_df)
+    log.info("test metrics: %s", metrics)
 
-    with mlflow.start_run(run_name=run_name) as run:
-        model = build_model(params)
-        model.fit(normal_rows(train_df))
-        metrics = evaluate(model, test_df)
-        log.info("test metrics: %s", metrics)
-
-        mlflow.log_params({f"model.{k}": v for k, v in params["model"].items()})
-        mlflow.log_params({"data_file": str(data_path), "train_rows": len(normal_rows(train_df)),
-                           "network": params["simulation"]["network"]})
+    data_tags = {"data_file": relative(data_file), "data_md5": file_md5(data_file), "trained_by": user}
+    with mlflow.start_run(run_name=f"train-{user}"):
+        mlflow.log_params(params["model"])
         mlflow.log_metrics(metrics)
-        mlflow.log_metric("threshold", model.threshold_)
-        mlflow.set_tags({"data_md5": file_md5(ROOT / data_path), "git_commit": registry.git_commit(),
-                         "triggered_by": user})
-
-        plot_path = REPORTS_DIR / "leak_scenario_example.png"
-        plot_scenario(model, test_df, plot_path)
-        mlflow.log_artifact(str(plot_path))
-
-        # cloudpickle because LeakDetector is our own class (skops only allows known types)
-        info = mlflow.sklearn.log_model(model, name="model",
-                                        serialization_format="cloudpickle",
+        mlflow.set_tags(data_tags)
+        # cloudpickle because LeakDetector is our own class
+        info = mlflow.sklearn.log_model(model, name="model", serialization_format="cloudpickle",
                                         registered_model_name=params["model"]["name"])
-        version = int(info.registered_model_version)
+    version = int(info.registered_model_version)
+    registry.tag_version(version, {**data_tags, **metrics})
+    registry.log_event("registered", version, user)
 
-    # tag the version so lineage can be traced from the registry alone
-    client = registry.get_client()
-    for k, v in {"data_md5": file_md5(ROOT / data_path), "data_file": str(data_path),
-                 "git_commit": registry.git_commit(), "test_f1": metrics["f1"],
-                 "test_roc_auc": metrics["roc_auc"]}.items():
-        client.set_model_version_tag(params["model"]["name"], str(version), k, str(v))
-    registry.record_lineage("registered", version, user, metrics=metrics)
+    # champion vs challenger on the same test data
+    champion = registry.get_alias("champion")
+    if champion is None:
+        decision = "promoted (first model)"
+        registry.promote(version, user, "first model")
+    else:
+        old = evaluate(registry.load(champion), test_df)
+        new_score, old_score = score_for_promotion(metrics, params), score_for_promotion(old, params)
+        reason = f"score v{champion}={old_score:.3f}, v{version}={new_score:.3f}"
+        if new_score > 0 and new_score >= old_score - 0.01:
+            decision = f"promoted (replaced v{champion})"
+            registry.promote(version, user, reason)
+        else:
+            decision = "kept as challenger"
+            registry.set_challenger(version)
+            registry.log_event("rejected", version, user, reason=reason)
 
-    decision = decide_promotion(version, metrics, test_df, params, user)
-    result = {"version": version, "run_id": run.info.run_id, "decision": decision, **metrics}
-    save_json(result, METRICS_DIR / "train_metrics.json")
+    result = {"version": version, "decision": decision, **metrics}
+    save_json(result, METRICS / "train_metrics.json")
+    log.info("v%d: %s", version, decision)
     return result
 
 
-def promotion_score(metrics, params):
-    p = params["promotion"]
-    if metrics["false_alarm_rate"] > p["max_false_alarm_rate"]:
-        return 0.0
-    return metrics[p["metric"]]
-
-
-def decide_promotion(version, metrics, test_df, params, user):
-    """Champion/challenger: compare the new model with production on the same test data."""
-    champion = registry.get_alias_version("champion")
-    if champion is None:
-        registry.promote(version, user, reason="first model")
-        return "promoted (first model)"
-
-    champ_model = mlflow.sklearn.load_model(f"models:/{params['model']['name']}@champion")
-    champ_metrics = evaluate(champ_model, test_df)
-    new_score = promotion_score(metrics, params)
-    old_score = promotion_score(champ_metrics, params)
-    log.info("challenger v%s score=%.3f vs champion v%s score=%.3f (champion false alarms %.1f%%)",
-             version, new_score, champion, old_score, 100 * champ_metrics["false_alarm_rate"])
-
-    reason = f"score {old_score:.3f} (v{champion}) -> {new_score:.3f} (v{version})"
-    if new_score > 0 and new_score - old_score >= params["promotion"]["min_improvement"]:
-        registry.promote(version, user, reason=reason)
-        return f"promoted (replaced v{champion})"
-
-    registry.set_challenger(version)
-    registry.record_lineage("rejected", version, user, reason=reason)
-    return f"kept as challenger (champion v{champion} is better)"
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default=str(DATA_DIR / "raw" / "sensor_data.csv"))
-    parser.add_argument("--run-name", default="train")
-    args = parser.parse_args()
-    result = train(args.data, args.run_name)
-    print(result)
-
-
 if __name__ == "__main__":
-    main()
+    train(sys.argv[1] if len(sys.argv) > 1 else TRAIN_FILE)

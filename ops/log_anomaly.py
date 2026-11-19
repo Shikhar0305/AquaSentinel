@@ -22,7 +22,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from sklearn.ensemble import IsolationForest  # noqa: E402
 
-from src.utils import LOGS_DIR, REPORTS_DIR, get_logger  # noqa: E402
+from src.config import LOGS, REPORTS, get_logger  # noqa: E402
 
 log = get_logger("log_anomaly")
 
@@ -93,16 +93,16 @@ def generate_demo_log(path, minutes=240, seed=1):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log", default=str(LOGS_DIR / "api.log"))
+    parser.add_argument("--log", default=str(LOGS / "api.log"))
     parser.add_argument("--generate-demo", action="store_true")
     args = parser.parse_args()
     path = args.log
     if args.generate_demo:
-        path = str(LOGS_DIR / "api_demo.log")
+        path = str(LOGS / "api_demo.log")
         generate_demo_log(path)
     feats = detect(per_minute(load_log(path)))
-    feats.to_csv(REPORTS_DIR / "log_anomalies.csv")
-    plot(feats, REPORTS_DIR / "log_anomalies.png")
+    feats.to_csv(REPORTS / "log_anomalies.csv")
+    plot(feats, REPORTS / "log_anomalies.png")
     log.info("%d of %d minutes look anomalous -> reports/log_anomalies.png", feats["anomaly"].sum(), len(feats))
     print(feats[feats["anomaly"]].round(3).to_string())
 

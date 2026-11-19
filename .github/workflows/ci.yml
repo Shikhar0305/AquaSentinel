@@ -30,11 +30,13 @@ jobs:
           python - <<'PY'
           import yaml
           p = yaml.safe_load(open("params.yaml"))
-          p["simulation"]["n_normal_scenarios"] = 4
-          p["simulation"]["n_leak_scenarios"] = 6
+          p["simulation"]["normal_scenarios"] = 4
+          p["simulation"]["leak_scenarios"] = 6
+          p["summer"]["normal_scenarios"] = 1
+          p["summer"]["leak_scenarios"] = 1
           yaml.safe_dump(p, open("params.yaml", "w"), sort_keys=False)
           PY
-          python -m src.simulate --mode train
+          python -m src.data simulate
           python -m src.train
           python -c "import json; m=json.load(open('metrics/train_metrics.json')); print(m); assert m['roc_auc'] > 0.7"
 
@@ -43,9 +45,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: metrics
-          path: |
-            metrics/
-            reports/
+          path: metrics/
 
   docker:
     needs: test
@@ -56,4 +56,4 @@ jobs:
         run: docker build -t aquasentinel:${{ github.sha }} .
       - name: Check the image starts
         run: |
-          docker run --rm aquasentinel:${{ github.sha }} python -c "import api.main, src.train; print('imports ok')"
+          docker run --rm aquasentinel:${{ github.sha }} python -c "import src.train, src.monitor; print('imports ok')"
