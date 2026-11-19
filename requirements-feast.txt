@@ -1,3 +1,0 @@
-# optional, used only for the feature store demo (feature_repo/)
-feast==0.68.0
-pyarrow
