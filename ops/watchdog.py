@@ -11,7 +11,7 @@ Every action is written to logs/incidents.jsonl so the website can show it.
 
 Two ways to run it:
     # watchdog starts and supervises the API itself (local development)
-    python -m ops.watchdog --start-cmd "uvicorn api.main:app --port 8000"
+    python -m ops.watchdog --start-cmd "python main.py"
 
     # API runs in Docker, watchdog restarts the container
     python -m ops.watchdog --restart-cmd "docker restart aquasentinel-api"
