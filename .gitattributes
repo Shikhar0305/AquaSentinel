@@ -1,0 +1,4 @@
+# keep line endings consistent between Windows and Linux
+* text=auto
+*.png binary
+*.joblib binary
