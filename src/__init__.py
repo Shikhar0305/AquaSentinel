@@ -1,0 +1,3 @@
+"""
+AquaSentinel project package.
+"""

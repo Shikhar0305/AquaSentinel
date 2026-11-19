@@ -1,0 +1,28 @@
+
+# AquaSentinel
+# Python 3.12 or 3.13 (64-bit)
+
+# Data Processing
+numpy==2.5.5
+pandas==2.2.3
+scipy==1.18.1
+
+# Water Network Simulation
+wntr==1.5.0
+
+# Machine Learning
+scikit-learn==1.9.1
+joblib==1.6.0
+
+# Experiment Tracking
+mlflow==3.18.0
+skops==0.16.0
+
+# Backend API
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.4
+
+# Testing
+pytest==9.2.0
+httpx==0.28.1
