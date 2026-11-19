@@ -155,13 +155,6 @@ def run_monitoring(role: str = Depends(require("admin"))):
     return result
 
 
-@app.post("/model/reload")
-def reload_model(role: str = Depends(require("admin"))):
-    store.reload()
-    audit(role, "reload")
-    return {"version": store.champion.version if store.champion else None}
-
-
 @app.post("/model/promote/{version}")
 def promote(version: int, role: str = Depends(require("admin"))):
     registry.promote(version, f"api:{role}", "manual promote")

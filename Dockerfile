@@ -18,7 +18,6 @@ COPY params.yaml .
 COPY src/ src/
 COPY api/ api/
 COPY web/ web/
-COPY ops/ ops/
 
 # run as a normal user, not root
 RUN useradd --create-home --uid 1000 appuser && mkdir -p data models logs metrics reports mlflow \

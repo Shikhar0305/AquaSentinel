@@ -120,6 +120,10 @@ class LeakDetector(BaseEstimator):
             "suspected_node": area,
         }, index=df.index)
 
+    def predict(self, df):
+        """1 = leak alert, 0 = no alert (lets MLflow serve the model as a normal sklearn model)."""
+        return self.predict_details(df)["leak_alert"].values
+
     def anomaly_score(self, df):
         return self.predict_details(df)["anomaly_score"].values
 
