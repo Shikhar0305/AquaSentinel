@@ -5,7 +5,6 @@ venv/
 .venv/
 
 # data and models are versioned with DVC / MLflow, not git
-/data/raw/
 /data/incoming/
 /data/snapshots/
 /data/features/
