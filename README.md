@@ -93,14 +93,14 @@ sees the timetable change. Limits are listed in sections 9 and 10.
 | 2 | Automated pipeline with Airflow | `dags/aquasentinel_dags.py` |
 | 2 | Data ingestion and validation | `src/data.py` (`ingest`, `validate`) |
 | 2 | Feature store | `feature_repo/` (Feast) |
-| 2 | Data and model versioning | `dvc.yaml` (DVC), MLflow tracking |
+| 2 | Data and model versioning | `dvc.yaml` + `dvc.lock` (DVC), MLflow tracking and registry |
 | 3 | Model served with FastAPI, tested with REST calls | `api/main.py`, `tests/test_api.py` |
 | 3 | Docker | `Dockerfile`, `docker-compose.yml` |
 | 3 | Model registry, canary and shadow rollout | `src/registry.py`, `api/models.py` |
 | 4 | Accuracy and drift monitoring | `src/train.py`, `src/monitor.py` (Evidently) |
 | 4 | Prometheus + Grafana | `monitoring/`, `/metrics` endpoint |
 | 4 | Drift (sensors + supply timetable) triggers retraining | `src/monitor.py`, hourly Airflow DAG |
-| 4 | CI/CD | `.github/workflows/ci.yml` (GitHub Actions) |
+| 4 | CI/CD | `.github/workflows/ci.yml`: tests, DVC pipeline, image published to GitHub Packages |
 | 5 | Capstone: monitoring, alerts, automatic rollback | watchdog compares the new model with the previous one |
 | 5 | Role-based access and model lineage | `api/auth.py`, `models/lineage.jsonl` |
 
@@ -108,7 +108,10 @@ sees the timetable change. Limits are listed in sections 9 and 10.
 
 ```
 aquasentinel/
+├── main.py              start the website + API (python main.py)
+├── commands.txt         every command in one place
 ├── params.yaml          all settings
+├── dvc.yaml, dvc.lock   data + training pipeline (DVC)
 ├── src/
 │   ├── config.py        paths and helpers
 │   ├── data.py          intermittent-supply simulation, validation, ingestion, Feast table
@@ -126,47 +129,63 @@ aquasentinel/
 ├── feature_repo/        Feast feature store
 ├── monitoring/          Prometheus config, alert rules, Grafana dashboard
 ├── tests/               23 tests
-└── Dockerfile, docker-compose.yml, dvc.yaml, .github/workflows/ci.yml
+├── .github/workflows/   CI/CD: lint, tests, DVC pipeline, Docker image published to GitHub Packages
+└── Dockerfile, docker-compose.yml
 ```
 
-## 6. How to run (VS Code / terminal)
+## 6. How to run
+
+All commands are also in `commands.txt`.
 
 **One time:**
 ```bash
 python -m venv venv
 venv\Scripts\activate              # Mac/Linux: source venv/bin/activate
 pip install -r requirements-dev.txt
-python -m src.data simulate        # about 2 minutes
-python -m src.train
+dvc repro                          # simulate data (about 2 minutes) and train the first model
 ```
 
 **Every time:**
 ```bash
 venv\Scripts\activate
-python -m uvicorn api.main:app --port 8000
+python main.py
 ```
 Open **http://localhost:8000** and sign in as Admin, Operator or Viewer.
 The API documentation is at http://localhost:8000/docs.
 
 **Optional:**
 ```bash
-python -m ops.watchdog                                      # auto-rollback (keep running in another terminal)
+python -m ops.watchdog                                          # auto-rollback (keep it running)
 mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000   # experiment tracking UI
-python -m ops.log_anomaly --generate-demo                   # log anomaly chart in reports/
-pytest -q                                                   # tests
-dvc repro                                                   # rebuild data + model with DVC (after git init, dvc init)
+python -m ops.log_anomaly --generate-demo                       # log anomaly chart in reports/
+pytest -q                                                       # tests
 ```
 
-**Full stack with Docker** (adds the MLflow server, Prometheus and Grafana):
+**Docker:** the CI/CD pipeline publishes a ready image on every push to `main`:
 ```bash
-docker compose up -d --build
-docker compose run --rm trainer
+docker pull ghcr.io/shikhar0305/aquasentinel:latest
+docker compose up -d --build          # full stack: website, MLflow server, Prometheus, Grafana
+docker compose run --rm trainer       # data + first model inside the stack
 ```
-Website http://localhost:8000 · MLflow http://localhost:5000 · Prometheus http://localhost:9090 · Grafana http://localhost:3000
+Website http://localhost:8000, MLflow http://localhost:5000, Prometheus http://localhost:9090, Grafana http://localhost:3000.
 
-**Airflow:** `export AQUA_HOME=$(pwd)`, point `dags_folder` to `dags/`, run `airflow standalone`.
-**Feast:** `pip install -r requirements-feast.txt`, `python -m src.data features`,
-then `cd feature_repo && feast apply && feast materialize-incremental <now>`, and run `python feature_repo/demo_feast.py`.
+**Airflow** and **Feast** commands are in `commands.txt`.
+
+### The MLOps pipeline
+
+```
+params.yaml ─► dvc repro ─► simulate ─► train ─► MLflow registry ─► models/production ─► API + website
+                                          ▲                                                 │
+                       retrain ◄── drift ◄┘◄── ingest new data ◄────── Prometheus /metrics ◄┘
+                                                                         watchdog: restart / rollback
+git push ─► GitHub Actions: lint ─► tests ─► dvc repro (quality gate) ─► Docker image ─► GitHub Packages
+```
+
+* `dvc repro` re-runs only the stages whose code, data or settings changed; `dvc.lock` records the exact
+  data hashes, so every model can be traced back to its data. `dvc metrics show` and `dvc params diff`
+  compare runs.
+* To store the data itself outside Git, add a DVC remote (for example a Google Drive folder):
+  `dvc remote add -d storage gdrive://<folder-id>` and `dvc push`.
 
 ## 7. Demo for the viva
 
@@ -186,7 +205,7 @@ then `cd feature_repo && feast apply && feast materialize-incremental <now>`, an
 4. **Access control.** Sign in as *Viewer*: Replay is disabled and admin actions are hidden.
    Calling `/predict` with the viewer key returns `403`.
 5. **Auto restart.** Run the watchdog with
-   `python -m ops.watchdog --start-cmd "python -m uvicorn api.main:app --port 8000"` and
+   `python -m ops.watchdog --start-cmd "python main.py"` and
    `ENABLE_CHAOS=true`, then call `POST /admin/crash` with the admin key. It comes back in about 15 s.
 
 ![Automatic rollback during a summer replay](docs/screenshots/summer_auto_rollback.png)
