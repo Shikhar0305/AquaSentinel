@@ -1,0 +1,11 @@
+python main.py
+
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+
+uvicorn src.api:app --reload
+
+python -m pytest tests/ -v
+
+docker build -t aquasentinel .
+
+docker run -p 8000:8000 aquasentinel
