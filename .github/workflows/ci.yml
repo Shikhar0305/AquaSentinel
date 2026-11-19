@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD
 
 on:
   push:
@@ -36,8 +36,8 @@ jobs:
           p["summer"]["leak_scenarios"] = 1
           yaml.safe_dump(p, open("params.yaml", "w"), sort_keys=False)
           PY
-          python -m src.data simulate
-          python -m src.train
+          dvc repro
+          dvc metrics show
           python -c "import json; m=json.load(open('metrics/train_metrics.json')); print(m); assert m['roc_auc'] > 0.7"
 
       - name: Upload metrics
@@ -47,13 +47,31 @@ jobs:
           name: metrics
           path: metrics/
 
+  # CD: build the Docker image and publish it to GitHub Container Registry (Packages)
   docker:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Image name in lowercase
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
       - name: Build image
-        run: docker build -t aquasentinel:${{ github.sha }} .
-      - name: Check the image starts
         run: |
-          docker run --rm aquasentinel:${{ github.sha }} python -c "import src.train, src.monitor; print('imports ok')"
+          docker build \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            -t $IMAGE:latest -t $IMAGE:${{ github.sha }} .
+
+      - name: Check the image starts
+        run: docker run --rm $IMAGE:latest python -c "import api.main, src.monitor; print('imports ok')"
+
+      - name: Publish to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push $IMAGE:latest
+          docker push $IMAGE:${{ github.sha }}
