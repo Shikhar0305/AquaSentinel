@@ -19,6 +19,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_sco
 
 from src import registry
 from src.config import METRICS, TRAIN_FILE, file_md5, get_logger, load_params, relative, save_json, tracking_uri
+from src.data import validate
 from src.model import build_model
 
 log = get_logger("train")
@@ -72,7 +73,7 @@ def train(data_file=TRAIN_FILE, user="pipeline"):
     mlflow.set_tracking_uri(tracking_uri())
     mlflow.set_experiment("aquasentinel")
 
-    df = pd.read_csv(data_file)
+    df, _ = validate(pd.read_csv(data_file), params)   # fills gaps from power cuts
     train_df, test_df = split_by_scenario(df, params["model"]["test_size"], params["model"]["seed"])
     model = build_model(params).fit(train_df[train_df["leak"] == 0])
     metrics = evaluate(model, test_df)

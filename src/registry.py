@@ -4,7 +4,8 @@ Model registry (MLflow) and lineage log.
 - Each training run creates a new version of the model.
 - Alias "champion"   = the version used in production.
 - Alias "challenger" = a newer version that is waiting (used for shadow/canary).
-- The champion is also copied to models/production/ so the API can load it fast.
+- The champion is also copied to models/production/ so the API can load it fast,
+  and the champion before it to models/previous/ (the "last good model").
 - Every promote / rollback is written to models/lineage.jsonl (who, when, which data).
 
     python -m src.registry list
@@ -80,6 +81,9 @@ def read_lineage():
 
 def promote(version, user="admin", reason=""):
     previous = get_alias("champion")
+    if previous is not None:
+        # keep the last good model next to the new one, so the API can compare them
+        export(previous, MODELS / "previous")
     client().set_registered_model_alias(name(), "champion", str(version))
     export(version, MODELS / "production")
     log_event("promoted", version, user, previous=previous, reason=reason)
@@ -96,6 +100,7 @@ def rollback(user="admin", reason="manual rollback"):
     for e in reversed(read_lineage()):
         if e["event"] in ("promoted", "rolled_back") and e["version"] == current and e.get("previous"):
             target = e["previous"]
+            export(current, MODELS / "previous")
             client().set_registered_model_alias(name(), "champion", str(target))
             export(target, MODELS / "production")
             log_event("rolled_back", target, user, previous=current, reason=reason)

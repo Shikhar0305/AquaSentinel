@@ -1,9 +1,11 @@
 """
 Everything about data: simulation, validation, ingestion and the feature table.
 
-Real sensor data from water utilities is not public, so we simulate the EPANET
-Net3 network with WNTR, add random leaks and label every reading after the leak
-starts as leak = 1.
+Real sensor data from water utilities is not public, so we simulate a supply zone
+(the EPANET Net3 network) with WNTR, the way most Indian cities run it:
+water is supplied only a few hours a day, households fill their storage tanks when
+the valve opens, supply timings slip, and power cuts leave gaps in the data.
+Random leaks are added and every reading after the leak starts is labelled leak = 1.
 
     python -m src.data simulate    # winter + summer data   -> data/raw/
     python -m src.data ingest      # next 4 summer scenarios -> data/incoming/recent_data.csv
@@ -22,19 +24,55 @@ log = get_logger("data")
 
 
 # ------------------------------------------------------------------ simulation
-def run_scenario(params, scenario_id, has_leak, demand_multiplier, rng):
+def supply_schedule(sim, windows, days, rng):
+    """
+    Intermittent supply: the zone valve opens only in a few windows a day.
+    Returns the demand multiplier and the valve status for every 15-minute step.
+    - while the valve is open, households fill their tanks and sumps, so demand
+      is high at the start and falls as the tanks fill up
+    - while it is closed, only a little water is used
+    - supply rarely starts exactly on time
+    """
+    demand = np.zeros(days * 96)
+    valve = np.zeros(days * 96, dtype=int)
+    shift = sim["supply_shift_min"] // 15
+    for day in range(days):
+        off_level = sim["off_supply_use"] * rng.uniform(0.7, 1.3)
+        demand[day * 96:(day + 1) * 96] = off_level * rng.uniform(0.9, 1.1, 96)
+        for start_h, end_h in windows:
+            start = day * 96 + int(start_h * 4) + int(rng.integers(-shift, shift + 1))
+            steps = int((end_h - start_h) * 4)
+            fill = np.linspace(*sim["storage_fill"], steps) * rng.uniform(1 - sim["fill_variation"],
+                                                                          1 + sim["fill_variation"])
+            demand[start:start + steps] = fill * rng.uniform(0.95, 1.05, steps)
+            valve[start:start + steps] = 1
+    return demand, valve
+
+
+def minutes_since_switch(valve):
+    """How long the valve has been in its current state (open or closed), in minutes."""
+    out = np.zeros(len(valve), dtype=int)
+    for i in range(1, len(valve)):
+        out[i] = out[i - 1] + 15 if valve[i] == valve[i - 1] else 0
+    return out
+
+
+def run_scenario(params, scenario_id, has_leak, demand_multiplier, windows, rng):
     sim = params["simulation"]
+    days = sim["days"]
     wn = wntr.network.WaterNetworkModel(sim["network"])
-    wn.options.time.duration = sim["days"] * 24 * 3600
+    wn.options.time.duration = days * 24 * 3600
     wn.options.time.hydraulic_timestep = 900     # 15 minutes
     wn.options.time.report_timestep = 900
+    wn.options.time.pattern_timestep = 900
     wn.options.hydraulic.demand_model = "PDD"    # needed for realistic leaks
 
-    # every scenario uses slightly different demand, like different weeks
-    factor = demand_multiplier * (1 + rng.uniform(-sim["demand_variation"], sim["demand_variation"]))
+    demand, valve = supply_schedule(sim, windows, days, rng)
+    wn.add_pattern("supply", list(demand))
     for _, junction in wn.junctions():
-        for demand in junction.demand_timeseries_list:
-            demand.base_value *= factor
+        for d in junction.demand_timeseries_list:
+            d.base_value *= demand_multiplier
+            d.pattern_name = "supply"
 
     leak_node, leak_area, leak_start = "", 0.0, None
     if has_leak:
@@ -53,21 +91,31 @@ def run_scenario(params, scenario_id, has_leak, demand_multiplier, rng):
     for col in flow.columns:
         df[f"F_{col}"] = (flow[col] + rng.normal(0, sim["noise_flow"], len(df))).round(3)
 
+    step = np.minimum(df.index.values // 900, len(valve) - 1)   # which 15-minute step each row is
+    df["valve_open"] = valve[step]
+    df["valve_minutes"] = minutes_since_switch(valve)[step]
     df["timestamp"] = pd.Timestamp("2026-01-01") + pd.to_timedelta(df.index, unit="s")
     df["scenario_id"] = scenario_id
     df["leak_node"] = leak_node
     df["leak_area"] = leak_area
     df["leak"] = 0 if leak_start is None else (df.index >= leak_start).astype(int)
 
-    df = df[df.index >= 24 * 3600]   # drop day 1: tanks are still settling
-    return df.reset_index(drop=True)
+    df = df[df.index >= 24 * 3600].reset_index(drop=True)   # drop day 1: tanks are still settling
+
+    # power cut: the sensors' data logger stops for 1-3 hours
+    if rng.random() < sim["power_cut_chance"]:
+        start = int(rng.integers(0, len(df) - 12))
+        cols = [c for c in df.columns if c.startswith(("P_", "F_"))]
+        df.loc[start:start + int(rng.integers(4, 13)), cols] = np.nan
+    return df
 
 
-def simulate(params, n_normal, n_leak, demand_multiplier, seed, prefix):
+def simulate(params, n_normal, n_leak, demand_multiplier, seed, prefix, windows=None):
     rng = np.random.default_rng(seed)
+    windows = windows or params["simulation"]["supply_windows"]
     frames = []
     for i, has_leak in enumerate([False] * n_normal + [True] * n_leak):
-        frames.append(run_scenario(params, f"{prefix}_{i:03d}", has_leak, demand_multiplier, rng))
+        frames.append(run_scenario(params, f"{prefix}_{i:03d}", has_leak, demand_multiplier, windows, rng))
         log.info("scenario %s_%03d done%s", prefix, i, " (leak)" if has_leak else "")
     data = pd.concat(frames, ignore_index=True)
     first = ["timestamp", "scenario_id"]
@@ -79,7 +127,8 @@ def simulate_all():
     s, w = p["simulation"], p["summer"]
     winter = simulate(p, s["normal_scenarios"], s["leak_scenarios"], 1.0, s["seed"], "winter")
     winter.to_csv(TRAIN_FILE, index=False)
-    summer = simulate(p, w["normal_scenarios"], w["leak_scenarios"], w["demand_multiplier"], w["seed"], "summer")
+    summer = simulate(p, w["normal_scenarios"], w["leak_scenarios"], w["demand_multiplier"], w["seed"], "summer",
+                      windows=w["supply_windows"])
     summer.to_csv(SUMMER_FILE, index=False)
     log.info("saved %d winter rows and %d summer rows", len(winter), len(summer))
 
@@ -122,7 +171,7 @@ def ingest(batch_size=4, source=SUMMER_FILE):
 # ------------------------------------------------------------------ feature table (for Feast)
 def build_feature_table():
     params = load_params()
-    df = pd.read_csv(TRAIN_FILE, parse_dates=["timestamp"])
+    df, _ = validate(pd.read_csv(TRAIN_FILE, parse_dates=["timestamp"]), params)
     pcols = [f"P_{n}" for n in params["sensors"]["pressure"]]
     out = pd.DataFrame({
         "scenario_id": df["scenario_id"],

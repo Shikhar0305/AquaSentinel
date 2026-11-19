@@ -57,5 +57,11 @@ def save_json(obj, path):
 
 
 def get_logger(name):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(message)s")
-    return logging.getLogger(name)
+    logger = logging.getLogger(f"aquasentinel.{name}")
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s | %(name)s | %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return logger

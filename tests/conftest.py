@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import load_params  # noqa: E402
-from src.data import simulate  # noqa: E402
+from src.data import simulate, validate  # noqa: E402
 from src.model import build_model  # noqa: E402
 
 
@@ -20,8 +20,13 @@ def params():
 
 
 @pytest.fixture(scope="session")
-def sim_data(params):
+def raw_data(params):
     return simulate(params, n_normal=4, n_leak=4, demand_multiplier=1.0, seed=1, prefix="test")
+
+
+@pytest.fixture(scope="session")
+def sim_data(params, raw_data):
+    return validate(raw_data, params)[0]   # fill power-cut gaps, like the real pipeline
 
 
 @pytest.fixture(scope="session")

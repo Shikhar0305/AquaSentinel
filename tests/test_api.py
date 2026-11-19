@@ -23,8 +23,9 @@ def client(tmp_path_factory, model):
 
 
 def body(rows):
-    return {"readings": [{"timestamp": str(r["timestamp"]), "sensors": {s: float(r[s]) for s in main.SENSORS}}
-                         for _, r in rows.iterrows()]}
+    return {"readings": [{"timestamp": str(r["timestamp"]), "valve_open": bool(r["valve_open"]),
+                          "valve_minutes": int(r["valve_minutes"]),
+                          "sensors": {s: float(r[s]) for s in main.SENSORS}} for _, r in rows.iterrows()]}
 
 
 def test_health(client):

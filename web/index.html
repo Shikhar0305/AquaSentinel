@@ -67,10 +67,13 @@
     <div class="map-wrap">
       <div class="map-head">
         <div>
-          <h2>Net3 distribution network</h2>
-          <p class="muted">97 junctions, 2 sources, 3 tanks. Diamonds are pressure sensors.</p>
+          <h2>Supply zone</h2>
+          <p class="muted">97 junctions fed from 2 sources and 3 service reservoirs. Diamonds are pressure sensors.</p>
         </div>
-        <div class="clock" id="clock" aria-live="off">–</div>
+        <div class="clock-block">
+          <div class="clock" id="clock" aria-live="off">–</div>
+          <p class="supply" id="supply">Supply status appears during replay</p>
+        </div>
       </div>
       <svg id="map" role="img" aria-label="Map of the water network"></svg>
       <div class="legend">
@@ -92,8 +95,8 @@
         <div class="field">
           <label for="season">Data</label>
           <select id="season">
-            <option value="winter">Winter (training season)</option>
-            <option value="summer">Summer (30% more demand)</option>
+            <option value="winter">Winter: supply 5–8 am and 5–7 pm</option>
+            <option value="summer">Summer rationing: supply 6–8 am only</option>
           </select>
         </div>
         <div class="field">
@@ -127,7 +130,7 @@
   <div class="chart-block">
     <div class="chart-head">
       <h3>Anomaly score and extra inflow</h3>
-      <p class="muted">The model raises an alert after 3 readings in a row above the threshold. The dotted line marks when the leak started.</p>
+      <p class="muted">Shaded bands are supply hours. The model raises an alert after 3 readings in a row above the threshold. The dotted line marks when the leak started.</p>
     </div>
     <div class="chart-box"><canvas id="score-chart"></canvas></div>
   </div>
@@ -162,13 +165,15 @@
 <section id="view-drift" class="view" hidden>
   <div class="page-head">
     <h2>Data drift</h2>
-    <p class="muted" id="drift-summary">No drift check has run yet.</p>
+    <p class="muted" id="drift-summary">No drift check has run yet. Sign in as Admin and use “Check new data for drift” on the Models page.</p>
   </div>
   <div class="drift">
     <div class="chart-box tall"><canvas id="psi-chart"></canvas></div>
     <div class="drift-side">
       <p class="big-number" id="drift-share">–</p>
-      <p class="muted">of sensors changed more than the PSI limit of <span id="psi-limit">0.5</span>. Retraining starts when it reaches half.</p>
+      <p class="muted">of sensors changed more than the PSI limit of <span id="psi-limit">0.25</span>.</p>
+      <p id="schedule-state"></p>
+      <p class="muted">Retraining starts when the supply timetable changes or half of the sensors drift.</p>
       <p id="drift-action" class="drift-action"></p>
       <a class="btn" href="/reports/drift" target="_blank" rel="noopener">Open full Evidently report</a>
     </div>

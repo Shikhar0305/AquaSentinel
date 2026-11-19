@@ -93,6 +93,13 @@ main { max-width: 1400px; margin: 0 auto; padding: 1.5rem; }
   font-family: var(--condensed); font-weight: 600; font-size: 2rem; line-height: 1;
   font-variant-numeric: tabular-nums; color: var(--water); white-space: nowrap;
 }
+.clock-block { text-align: right; }
+.supply { margin-top: 0.35rem; font-size: 0.9rem; color: var(--muted); }
+.supply.on, .supply.off { display: inline-flex; align-items: center; gap: 0.4rem; font-weight: 500; }
+.supply.on { color: var(--water); }
+.supply.on::before, .supply.off::before { content: ""; width: 0.55rem; height: 0.55rem; border-radius: 50%; }
+.supply.on::before { background: var(--water); }
+.supply.off::before { background: var(--pipe); }
 #map { width: 100%; flex: 1; min-height: 470px; display: block; margin: 0.5rem 0; overflow: visible; }
 #map .pipe { stroke: var(--pipe); stroke-width: 2.2; stroke-linecap: round; }
 #map .pipe.hot { stroke: var(--alarm); stroke-width: 3.2; }

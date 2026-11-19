@@ -1,9 +1,13 @@
 """
 Monitoring cycle: ingest new data -> check drift -> retrain if needed.
 
-Drift check (Evidently): for every sensor we compare the new data with the data
-the production model was trained on, using PSI (population stability index).
-If at least half of the sensors drifted, the model needs retraining.
+Drift check (Evidently): we compare the new data with the data the production
+model was trained on, using PSI (population stability index), for every sensor
+and for the supply timetable (valve open/closed and for how long).
+
+Retraining is needed when
+  - the supply timetable changed (e.g. summer rationing: one supply a day instead of two), or
+  - at least half of the sensors drifted (e.g. a new pipeline or pump).
 
     python -m src.monitor          # run one cycle (Airflow runs this every hour)
 
@@ -20,22 +24,28 @@ from evidently.presets import DataDriftPreset
 
 from src.config import DATA, METRICS, MODELS, RECENT_FILE, REPORTS, ROOT, TRAIN_FILE
 from src.config import get_logger, load_params, relative, save_json, sensor_columns
-from src.data import ingest
+from src.data import ingest, validate
 
 log = get_logger("monitor")
 
 
-def check_drift(reference, current, columns, psi_limit=0.5, share_limit=0.5, html=None):
+SCHEDULE = ["valve_open", "valve_minutes"]
+
+
+def check_drift(reference, current, sensors, psi_limit=0.25, share_limit=0.5, html=None):
+    columns = sensors + [c for c in SCHEDULE if c in reference and c in current]
     ref = reference[columns].sample(min(1000, len(reference)), random_state=0)
     cur = current[columns].sample(min(1000, len(current)), random_state=0)
     snapshot = Report([DataDriftPreset(method="psi", threshold=psi_limit)]).run(cur, ref)
     psi = {m["config"]["column"]: round(float(m["value"]), 3)
            for m in snapshot.dict()["metrics"] if m["config"]["type"].endswith("ValueDrift")}
-    drifted = [c for c, v in psi.items() if v > psi_limit]
+    drifted = [c for c in sensors if psi[c] > psi_limit]
+    schedule_changed = any(psi[c] > psi_limit for c in SCHEDULE if c in psi)
+    share = len(drifted) / len(sensors)
     if html:
         snapshot.save_html(str(html))
-    return {"psi": psi, "drifted": drifted, "drift_share": round(len(drifted) / len(columns), 3),
-            "drift_detected": len(drifted) / len(columns) >= share_limit}
+    return {"psi": psi, "drifted": drifted, "drift_share": round(share, 3), "schedule_changed": schedule_changed,
+            "drift_detected": schedule_changed or share >= share_limit}
 
 
 def production_training_file():
@@ -52,14 +62,15 @@ def run_cycle():
     if not RECENT_FILE.exists():
         return {"status": "no data"}
 
-    reference = pd.read_csv(production_training_file())
+    reference, _ = validate(pd.read_csv(production_training_file()), params)
     reference = reference[reference["leak"] == 0]          # normal behaviour the model knows
-    recent = pd.read_csv(RECENT_FILE)                        # everything that came in
+    recent = pd.read_csv(RECENT_FILE)                        # everything that came in (already cleaned)
     result = check_drift(reference, recent, sensor_columns(params), m["psi_limit"], m["drift_share"],
                          html=REPORTS / "drift_report.html")
     result.update({"time": datetime.now().isoformat(timespec="seconds"),
                    "reference": relative(production_training_file()), "current": relative(RECENT_FILE)})
-    log.info("drift share %.2f -> drift detected: %s", result["drift_share"], result["drift_detected"])
+    log.info("sensor drift %.2f, timetable changed: %s -> drift: %s",
+             result["drift_share"], result["schedule_changed"], result["drift_detected"])
 
     scenarios = recent["scenario_id"].nunique()
     if not result["drift_detected"]:

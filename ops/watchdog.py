@@ -3,9 +3,10 @@ AIOps watchdog - automatic remediation for the AquaSentinel API.
 
 Every few seconds it:
 1. Calls /health. After N failures in a row it RESTARTS the service.
-2. Reads /model/info. If the share of readings flagged as anomalous is far too
-   high, the model is probably broken (or the data changed), so it ROLLS BACK
-   to the previous model version through the admin API.
+2. Reads /model/info. The API scores every reading with the production model AND
+   with the previous (last good) model. A real leak makes both raise alarms. If the
+   new model flags far more readings than the old one on the same data, the new
+   model is the problem, so the watchdog ROLLS BACK through the admin API.
 Every action is written to logs/incidents.jsonl so the website can show it.
 
 Two ways to run it:
@@ -40,13 +41,13 @@ def record(kind, detail):
 
 class Watchdog:
     def __init__(self, url, admin_key, start_cmd=None, restart_cmd=None, max_failures=3,
-                 max_anomaly_rate=0.5, min_predictions=100, cooldown=300):
+                 max_extra_alarms=0.3, min_predictions=100, cooldown=60):
         self.url = url.rstrip("/")
         self.admin_key = admin_key
         self.start_cmd = start_cmd
         self.restart_cmd = restart_cmd
         self.max_failures = max_failures
-        self.max_anomaly_rate = max_anomaly_rate
+        self.max_extra_alarms = max_extra_alarms   # allowed difference between new and old model
         self.min_predictions = min_predictions
         self.cooldown = cooldown          # seconds to wait after a rollback before checking again
         self.failures = 0
@@ -88,7 +89,7 @@ class Watchdog:
         return healthy
 
     def check_model(self):
-        """Rule: too many anomalies after enough predictions -> bad model -> roll back."""
+        """Rule: new model flags 30% more readings than the last good model -> roll back."""
         if time.time() - self.last_rollback < self.cooldown:
             return
         headers = {"X-API-Key": self.admin_key}
@@ -97,9 +98,13 @@ class Watchdog:
         except (requests.RequestException, ValueError):
             return
         rate, n = info.get("recent_anomaly_rate", 0), info.get("recent_predictions", 0)
-        if n >= self.min_predictions and rate > self.max_anomaly_rate:
-            version = info["champion"]["version"]
-            reason = f"auto-rollback: v{version} flagged {rate:.0%} of last {n} readings"
+        old_rate = info.get("previous_anomaly_rate")
+        if old_rate is None or n < self.min_predictions:
+            return
+        if rate - old_rate > self.max_extra_alarms:
+            version, old = info["champion"]["version"], info["previous_version"]
+            reason = (f"auto-rollback: v{version} flagged {rate:.0%} of the last {n} readings, "
+                      f"v{old} flagged {old_rate:.0%} of the same readings")
             r = requests.post(f"{self.url}/model/rollback", params={"reason": reason}, headers=headers, timeout=30)
             if r.ok:
                 record("model_rolled_back", f"{reason} -> now v{r.json()['rolled_back_to']}")
@@ -123,10 +128,9 @@ def main():
     parser.add_argument("--start-cmd", help="command that starts the API (watchdog supervises it)")
     parser.add_argument("--restart-cmd", help="command that restarts an API running elsewhere")
     parser.add_argument("--interval", type=int, default=5)
-    parser.add_argument("--max-anomaly-rate", type=float, default=0.5)
     args = parser.parse_args()
-    Watchdog(args.url, os.getenv("AQUA_ADMIN_KEY", "admin-dev-key"), args.start_cmd, args.restart_cmd,
-             max_anomaly_rate=args.max_anomaly_rate).run(args.interval)
+    admin_key = os.getenv("AQUA_ADMIN_KEY", "admin-dev-key")
+    Watchdog(args.url, admin_key, args.start_cmd, args.restart_cmd).run(args.interval)
 
 
 if __name__ == "__main__":

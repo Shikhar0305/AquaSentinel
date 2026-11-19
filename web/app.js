@@ -37,6 +37,8 @@ function toast(message) {
   t._timer = setTimeout(() => (t.hidden = true), 4500);
 }
 
+const fmtDuration = (m) => (m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60 ? (m % 60) + " min" : ""}`.trim());
+
 const fmtTime = (iso) => new Date(iso.replace(" ", "T")).toLocaleString("en-GB",
   { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 
@@ -193,6 +195,8 @@ function resetMonitor() {
   setStatus("normal", "Waiting", "Press Replay to stream this scenario's sensor readings through the model, one 15-minute reading at a time.");
   ["#ro-inflow", "#ro-score", "#ro-count", "#ro-alerts"].forEach((s) => ($(s).textContent = "–"));
   $("#clock").textContent = "–";
+  $("#supply").className = "supply";
+  $("#supply").textContent = "Supply status appears during replay";
   updateTruth();
   drawScoreChart();
 }
@@ -236,7 +240,8 @@ async function step(i) {
   for (let j = from; j <= i; j++) {
     const sensors = {};
     for (const [name, values] of Object.entries(d.sensors)) sensors[name] = values[j];
-    readings.push({ timestamp: d.timestamps[j], sensors });
+    readings.push({ timestamp: d.timestamps[j], valve_open: d.valve_open[j] === 1,
+                    valve_minutes: d.valve_minutes[j], sensors });
   }
   try {
     const res = await api("/predict", { method: "POST", body: JSON.stringify({ readings }) });
@@ -259,20 +264,32 @@ async function step(i) {
 function showReading(i) {
   const r = state.results[state.results.length - 1];
   const alerts = state.results.filter((x) => x.leak_alert).length;
+  const open = state.data.valve_open[i] === 1;
+  const mins = state.data.valve_minutes[i];
   $("#clock").textContent = fmtTime(state.data.timestamps[i]);
+  $("#supply").className = `supply ${open ? "on" : "off"}`;
+  $("#supply").textContent = open
+    ? `Supply on for ${fmtDuration(mins)}`
+    : `Supply off for ${fmtDuration(mins)}`;
   $("#ro-inflow").textContent = `${r.extra_inflow > 0 ? "+" : ""}${r.extra_inflow.toFixed(1)} L/s`;
   $("#ro-score").textContent = r.anomaly_score.toFixed(3);
   $("#ro-count").textContent = `${i + 1} / ${state.data.timestamps.length}`;
   $("#ro-alerts").textContent = alerts;
+  $("#model-chip").textContent = `model v${r.version}`;
 
   if (r.leak_alert) {
+    const kl = Math.max(0, r.extra_inflow) * 86.4;   // L/s -> kilolitres per day
     setStatus("leak", "Leak alert",
-      `About ${Math.round(r.extra_inflow)} L/s more water is entering the network than normal for this time. ` +
+      `About ${Math.round(r.extra_inflow)} L/s more water is entering the zone than normal ` +
+      `(roughly ${Math.round(kl).toLocaleString("en-IN")} kL a day if it continues). ` +
       `The biggest pressure drop is near junction ${r.suspected_node}. Send a crew to check that area.`);
   } else if (r.is_anomaly) {
-    setStatus("watch", "Unusual", "Inflow is higher than normal. An alert is raised if this lasts 45 minutes.");
+    setStatus("watch", "Unusual", "Inflow is higher than normal for this point in the supply cycle. " +
+      "An alert is raised if this lasts 45 minutes.");
   } else {
-    setStatus("ok", "Normal", "Inflow matches a normal day at this time.");
+    setStatus("ok", "Normal", open
+      ? "Inflow matches a normal supply period. Households are filling their tanks."
+      : "Supply is off and almost no water is flowing, as expected.");
   }
   updateTruth();
   updateScoreChart();
@@ -299,22 +316,39 @@ $("#scenario").addEventListener("change", resetMonitor);
 $("#show-truth").addEventListener("change", updateTruth);
 
 // ------------------------------------------------------------------ charts
-// draws a dotted vertical line at a given x index (used for "leak started")
+// draws dotted vertical lines with a label (leak started, model changed)
 const markerPlugin = {
   id: "marker",
   afterDatasetsDraw(chart, _args, opts) {
-    if (opts.index == null || opts.index < 0) return;
-    const x = chart.scales.x.getPixelForValue(opts.index);
     const { top, bottom } = chart.chartArea;
     const ctx = chart.ctx;
+    (opts.lines || []).forEach(({ index, label, color }) => {
+      const x = chart.scales.x.getPixelForValue(index);
+      ctx.save();
+      ctx.strokeStyle = ctx.fillStyle = color || COLORS.ink;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
+      ctx.font = "600 12px 'Barlow Semi Condensed', sans-serif";
+      ctx.fillText(label, x + 6, top + 12);
+      ctx.restore();
+    });
+  },
+};
+
+// shades the chart background wherever the supply valve was open
+const supplyPlugin = {
+  id: "supply",
+  beforeDatasetsDraw(chart, _args, opts) {
+    const valve = opts.valve || [];
+    const { top, bottom } = chart.chartArea;
+    const x = chart.scales.x;
+    const ctx = chart.ctx;
     ctx.save();
-    ctx.strokeStyle = COLORS.ink;
-    ctx.setLineDash([3, 4]);
-    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = COLORS.ink;
-    ctx.font = "600 12px 'Barlow Semi Condensed', sans-serif";
-    ctx.fillText(opts.label || "", x + 6, top + 12);
+    ctx.fillStyle = "rgba(15,111,168,0.08)";
+    const half = valve.length > 1 ? (x.getPixelForValue(1) - x.getPixelForValue(0)) / 2 : 0;
+    valve.forEach((v, i) => {
+      if (v === 1) ctx.fillRect(x.getPixelForValue(i) - half, top, half * 2, bottom - top);
+    });
     ctx.restore();
   },
 };
@@ -334,7 +368,8 @@ function drawScoreChart() {
   const options = baseOptions();
   options.scales.y = { title: { display: true, text: "anomaly score" }, grace: "5%" };
   options.scales.y2 = { position: "right", title: { display: true, text: "extra inflow (L/s)" }, grid: { display: false } };
-  options.plugins.marker = { index: -1, label: "leak starts" };
+  options.plugins.marker = { lines: [] };
+  options.plugins.supply = { valve: [] };
   state.charts.score = new Chart($("#score-chart"), {
     data: {
       labels: [],
@@ -347,7 +382,7 @@ function drawScoreChart() {
       ],
     },
     options,
-    plugins: [markerPlugin],
+    plugins: [markerPlugin, supplyPlugin],
   });
 }
 
@@ -360,8 +395,16 @@ function updateScoreChart() {
   chart.data.datasets[0].pointRadius = state.results.map((r) => (r.leak_alert ? 3 : 0));
   chart.data.datasets[1].data = state.results.map(() => state.threshold);
   chart.data.datasets[2].data = state.results.map((r) => r.extra_inflow);
+  const lines = [];
   const leakStart = state.data.leak.indexOf(1);
-  chart.options.plugins.marker.index = leakStart >= 0 && leakStart < n ? leakStart : -1;
+  if (leakStart >= 0 && leakStart < n) lines.push({ index: leakStart, label: "leak starts" });
+  state.results.forEach((r, i) => {
+    if (i > 0 && r.version !== state.results[i - 1].version) {
+      lines.push({ index: i, label: `model v${r.version} takes over`, color: COLORS.water });
+    }
+  });
+  chart.options.plugins.marker.lines = lines;
+  chart.options.plugins.supply.valve = state.data.valve_open.slice(0, n);
   chart.update("none");
 }
 
@@ -378,7 +421,9 @@ async function loadModels() {
       <div><dt>Leaks detected</dt><dd>${Math.round(c.leaks_detected * 100)}%</dd></div>
       <div><dt>Typical delay</dt><dd>${Math.round(c.detection_delay_min)} min</dd></div>
       <div><dt>False alarms</dt><dd>${(c.false_alarm_rate * 100).toFixed(1)}%</dd></div>
-      <div><dt>Flagged in last 500 readings</dt><dd>${(info.recent_anomaly_rate * 100).toFixed(1)}%</dd></div>
+      <div><dt>Readings flagged by v${c.version}</dt><dd>${(info.recent_anomaly_rate * 100).toFixed(1)}%</dd></div>
+      <div><dt>Same readings, previous v${info.previous_version ?? "–"}</dt>
+        <dd>${info.previous_anomaly_rate == null ? "–" : (info.previous_anomaly_rate * 100).toFixed(1) + "%"}</dd></div>
     </dl>
     <p class="trained-on">Trained on <strong>${c.data_file}</strong> (MD5 ${c.data_md5}).
       Waiting model: ${info.challenger ? "v" + info.challenger.version : "none"}.
@@ -424,9 +469,12 @@ $("#rollback").addEventListener("click", (e) => adminAction(e.target,
 async function loadDrift() {
   const d = await api("/monitoring/drift");
   if (!d.psi) return;
-  const limit = 0.5;
+  const limit = 0.25;
   $("#psi-limit").textContent = limit;
   $("#drift-share").textContent = `${Math.round(d.drift_share * 100)}%`;
+  $("#schedule-state").textContent = d.schedule_changed
+    ? "The supply timetable has changed since the model was trained."
+    : "The supply timetable is the same as in training.";
   $("#drift-summary").textContent = `Last check ${fmtTime(d.time)}: ${d.current} compared with ${d.reference}.`;
   $("#drift-action").textContent = d.action ? d.action.charAt(0).toUpperCase() + d.action.slice(1) + "." : "";
 
@@ -439,7 +487,8 @@ async function loadDrift() {
   state.charts.psi = new Chart($("#psi-chart"), {
     type: "bar",
     data: {
-      labels: entries.map(([k]) => (k.startsWith("P_") ? `pressure ${k.slice(2)}` : `flow ${k.slice(2)}`)),
+      labels: entries.map(([k]) => ({ valve_open: "supply valve status", valve_minutes: "supply timing" }[k]
+        || (k.startsWith("P_") ? `pressure ${k.slice(2)}` : `flow ${k.slice(2)}`))),
       datasets: [{ data: entries.map(([, v]) => v),
                    backgroundColor: entries.map(([, v]) => (v > limit ? COLORS.alarm : COLORS.water)) }],
     },

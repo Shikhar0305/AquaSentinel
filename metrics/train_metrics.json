@@ -1,11 +1,11 @@
 {
   "version": 2,
   "decision": "promoted (replaced v1)",
-  "precision": 1.0,
-  "recall": 0.598,
-  "f1": 0.7485,
-  "roc_auc": 0.9875,
+  "precision": 0.9579,
+  "recall": 0.7913,
+  "f1": 0.8667,
+  "roc_auc": 0.9902,
   "leaks_detected": 1.0,
-  "detection_delay_min": 82.5,
-  "false_alarm_rate": 0.0
+  "detection_delay_min": 37.5,
+  "false_alarm_rate": 0.0054
 }

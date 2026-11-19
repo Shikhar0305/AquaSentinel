@@ -8,10 +8,27 @@ from src.train import evaluate, split_by_scenario
 
 
 # ---------------- data
-def test_simulation_has_every_sensor_and_no_gaps(params, sim_data):
+def test_simulation_has_every_sensor_and_no_gaps_after_cleaning(params, sim_data):
     cols = sensor_columns(params)
-    assert set(cols + ["timestamp", "scenario_id", "leak"]) <= set(sim_data.columns)
+    assert set(cols + ["timestamp", "scenario_id", "leak", "valve_open", "valve_minutes"]) <= set(sim_data.columns)
     assert not sim_data[cols].isna().any().any()
+
+
+def test_supply_is_intermittent(params, sim_data):
+    # two supply windows of 3 h and 2 h = about 5 of 24 hours
+    share_open = sim_data["valve_open"].mean()
+    assert 0.15 < share_open < 0.30
+    # far more water flows while the valve is open
+    inflow = sim_data[[f"F_{p}" for p in params["sensors"]["inflow"]]].sum(axis=1)
+    normal = sim_data["leak"] == 0
+    supply_on, supply_off = normal & (sim_data["valve_open"] == 1), normal & (sim_data["valve_open"] == 0)
+    assert inflow[supply_on].mean() > 5 * inflow[supply_off].mean()
+
+
+def test_valve_minutes_resets_when_valve_switches(sim_data):
+    g = sim_data[sim_data["scenario_id"] == "test_000"]
+    switched = g["valve_open"].diff().fillna(0) != 0
+    assert (g.loc[switched, "valve_minutes"] == 0).all()
 
 
 def test_first_day_is_dropped(sim_data):
@@ -65,11 +82,11 @@ def test_alert_needs_three_anomalies_in_a_row(model, sim_data):
             assert flags[i - 2:i + 1].all()
 
 
-def test_less_water_than_normal_is_never_a_leak(model, sim_data, params):
-    low = sim_data[sim_data["leak"] == 0].copy()
-    for p in params["sensors"]["inflow"]:
-        low[f"F_{p}"] *= 0.7     # 30% less inflow everywhere
-    assert model.predict_details(low)["is_anomaly"].sum() == 0
+def test_less_water_than_normal_never_raises_more_alarms(model, sim_data):
+    normal = sim_data[sim_data["leak"] == 0]
+    low = normal.copy()
+    low["F_60"] -= 40     # 40 L/s less water entering the zone
+    assert model.predict_details(low)["is_anomaly"].sum() <= model.predict_details(normal)["is_anomaly"].sum()
 
 
 def test_suspected_node_is_a_pressure_sensor(model, sim_data, params):
@@ -83,6 +100,14 @@ def test_no_drift_between_normal_days(sim_data, params):
     a = normal[normal["scenario_id"].isin(["test_000", "test_001"])]
     b = normal[normal["scenario_id"].isin(["test_002", "test_003"])]
     assert not check_drift(a, b, sensor_columns(params))["drift_detected"]
+
+
+def test_drift_when_supply_timetable_changes(sim_data, params):
+    ref = sim_data[sim_data["leak"] == 0]
+    rationed = ref.copy()
+    rationed["valve_minutes"] = rationed["valve_minutes"] * 3   # much longer gaps between supplies
+    result = check_drift(ref, rationed, sensor_columns(params))
+    assert result["schedule_changed"] and result["drift_detected"]
 
 
 def test_drift_when_demand_goes_up(sim_data, params):

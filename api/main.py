@@ -28,6 +28,7 @@ from api.auth import audit, current_role, require
 from api.models import ModelStore
 from src import registry
 from src.config import LOGS, METRICS, ROOT, SUMMER_FILE, TRAIN_FILE, load_params, sensor_columns
+from src.data import validate
 
 PARAMS = load_params()
 SENSORS = sensor_columns(PARAMS)
@@ -66,6 +67,8 @@ async def log_requests(request: Request, call_next):
 # ------------------------------------------------------------ prediction
 class Reading(BaseModel):
     timestamp: datetime
+    valve_open: bool = Field(..., description="Is the zone supply valve open (from SCADA)?")
+    valve_minutes: int = Field(..., ge=0, description="Minutes since the valve last opened or closed")
     sensors: Dict[str, float] = Field(..., examples=[{"P_15": 27.5, "F_60": 830.2}])
 
 
@@ -91,7 +94,8 @@ def predict(req: PredictRequest, role: str = Depends(require("operator"))):
         missing = [s for s in SENSORS if s not in r.sensors]
         if missing:
             raise HTTPException(422, f"missing sensors: {missing}")
-        rows.append({"timestamp": r.timestamp, **r.sensors})
+        rows.append({"timestamp": r.timestamp, "valve_open": int(r.valve_open),
+                     "valve_minutes": r.valve_minutes, **r.sensors})
     df = pd.DataFrame(rows)
 
     chosen, served_by = store.pick()
@@ -100,6 +104,9 @@ def predict(req: PredictRequest, role: str = Depends(require("operator"))):
         shadow = store.challenger.model.predict_details(df)
         if shadow["is_anomaly"].iloc[-1] != out["is_anomaly"].iloc[-1]:
             SHADOW_DIFF.inc()
+
+    if store.previous:   # last good model scores the same readings in the background
+        store.recent_previous.append(int(store.previous.model.predict_details(df)["is_anomaly"].iloc[-1]))
 
     last = out.iloc[-1]
     store.recent.append(int(last["is_anomaly"]))
@@ -122,7 +129,9 @@ def model_info(role: str = Depends(require("viewer"))):
     return {"champion": store.champion.info if store.champion else None,
             "challenger": store.challenger.info if store.challenger else None,
             "shadow_mode": store.shadow, "canary_percent": store.canary,
-            "recent_anomaly_rate": round(store.anomaly_rate(), 4), "recent_predictions": len(store.recent)}
+            "recent_anomaly_rate": round(store.anomaly_rate(), 4), "recent_predictions": len(store.recent),
+            "previous_version": store.previous.version if store.previous else None,
+            "previous_anomaly_rate": round(store.rate(store.recent_previous), 4) if store.previous else None}
 
 
 @app.get("/model/lineage")
@@ -197,7 +206,7 @@ def load_season(season):
     path = TRAIN_FILE if season == "winter" else SUMMER_FILE
     if not path.exists():
         raise HTTPException(404, "No data yet. Run: python -m src.data simulate")
-    return pd.read_csv(path)
+    return validate(pd.read_csv(path), PARAMS)[0]   # fills gaps left by power cuts
 
 
 @app.get("/api/me")
@@ -232,6 +241,7 @@ def scenario(scenario_id: str, season: str = "winter", role: str = Depends(requi
     if rows.empty:
         raise HTTPException(404, "unknown scenario")
     return {"timestamps": rows["timestamp"].tolist(), "leak": rows["leak"].tolist(),
+            "valve_open": rows["valve_open"].tolist(), "valve_minutes": rows["valve_minutes"].tolist(),
             "sensors": {s: rows[s].round(3).tolist() for s in SENSORS}}
 
 

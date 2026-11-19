@@ -1,16 +1,22 @@
 """
-The leak detection model.
+The leak detection model, built for intermittent supply (water for a few hours a day).
 
 Idea - the WATER BALANCE:
-    water going into the network (2 sources + 3 tanks) = water used + leaks
-So a leak shows up as extra inflow compared with a normal day at the same time.
+    water going into the zone (2 sources + 3 tanks) = water used + leaks
+So a leak shows up as extra inflow compared with normal.
 
-Features: extra inflow (actual - normal for that 15-min slot of the day),
-averaged over 15 min, 1 h and 3 h. A short spike and a slow, steady increase
-(a leak) look different across these windows.
+What is "normal" depends on the supply phase, not the clock: supply timings slip
+from day to day, and right after the valve opens households fill their tanks, so
+inflow is very high and varies a lot. When the valve is closed almost no water is
+used, so a leak stands out clearly. (Indian utilities use the same idea when they
+check minimum flow while supply is off.)
 
-Model: Isolation Forest trained only on normal readings. Unusual points are
-easy to isolate with random splits, so they get a higher anomaly score.
+So for every phase step - "valve open for 0-15 min", "open 15-30 min", ...
+"closed for 2 h" - we learn the normal inflow and how much it varies, and turn
+each reading into a z-score: how many standard deviations above normal it is.
+
+Features: that z-score averaged over 15 min, 1 h and 3 h.
+Model: Isolation Forest trained only on normal readings.
 """
 import numpy as np
 import pandas as pd
@@ -19,10 +25,17 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 
-def time_slot(df):
-    """0..95 = which 15-minute slot of the day the reading belongs to."""
-    ts = pd.to_datetime(df["timestamp"])
-    return (ts.dt.hour * 4 + ts.dt.minute // 15).values
+MAX_STEPS = 48   # phases longer than 12 hours share the last slot
+
+
+def phase_slot(df):
+    """Slot number for the supply phase: 0-47 = valve closed, 100-147 = valve open."""
+    steps = np.minimum(df["valve_minutes"].values // 15, MAX_STEPS - 1)
+    return df["valve_open"].values * 100 + steps
+
+
+def all_slots():
+    return list(range(MAX_STEPS)) + list(range(100, 100 + MAX_STEPS))
 
 
 class LeakDetector(BaseEstimator):
@@ -43,31 +56,37 @@ class LeakDetector(BaseEstimator):
         for n in self.pressure_sensors:
             out[f"P_{n}"] = df[f"P_{n}"]
         out["group"] = df["scenario_id"] if "scenario_id" in df else 0   # live data = one stream
-        out["slot"] = time_slot(df)
+        out["slot"] = phase_slot(df)
         return out
 
+    def _smooth(self, series, groups, w):
+        return series.groupby(groups).transform(lambda s: s.rolling(w, min_periods=1).mean())
+
     def _features(self, prep):
-        extra = prep["net_inflow"] - self.normal_.loc[prep["slot"], "net_inflow"].values
-        feats = {}
-        for w in self.windows:
-            feats[f"extra_inflow_{w * 15}min"] = extra.groupby(prep["group"]).transform(
-                lambda s, w=w: s.rolling(w, min_periods=1).mean())
-        return pd.DataFrame(feats)
+        normal = self.normal_.loc[prep["slot"]]
+        z = (prep["net_inflow"] - normal["net_inflow"].values) / self.spread_.loc[prep["slot"], "net_inflow"].values
+        return pd.DataFrame({f"inflow_z_{w * 15}min": self._smooth(z, prep["group"], w) for w in self.windows})
 
     # ---------------- training
     def fit(self, normal_df):
         prep = self._prepare(normal_df)
-        # normal value of every column for each time slot of the day
-        self.normal_ = prep.drop(columns="group").groupby("slot").median().reindex(range(96)).interpolate()
+        # normal value and normal spread of every column for each supply phase slot
+        by_slot = prep.drop(columns="group").groupby("slot")
+        self.normal_ = self._fill(by_slot.median())
+        self.spread_ = self._fill(by_slot.std()).clip(lower=0.1)
         X = self._features(prep)
         self.scaler_ = StandardScaler().fit(X)
         self.forest_ = IsolationForest(n_estimators=self.n_estimators, random_state=self.seed)
         self.forest_.fit(self.scaler_.transform(X))
         self.threshold_ = float(np.percentile(self._score(X), self.threshold_percentile))
-        # how much each pressure sensor normally varies (used for the suspected area)
-        pcols = [f"P_{n}" for n in self.pressure_sensors]
-        self.pressure_std_ = (prep[pcols] - self.normal_.loc[prep["slot"], pcols].values).std()
         return self
+
+    @staticmethod
+    def _fill(table):
+        """Slots never seen in training borrow the nearest slot with the same valve state."""
+        table = table.reindex(all_slots())
+        closed, opened = table.loc[:MAX_STEPS - 1].ffill().bfill(), table.loc[100:].ffill().bfill()
+        return pd.concat([closed, opened]).fillna(table.mean())
 
     # ---------------- prediction
     def _score(self, X):
@@ -78,22 +97,26 @@ class LeakDetector(BaseEstimator):
         prep = self._prepare(df)
         X = self._features(prep)
         scores = self._score(X)
-        extra = X.iloc[:, min(1, X.shape[1] - 1)].values     # 1-hour extra inflow
         # a leak can only ADD water, so less inflow than normal is never a leak
-        anomaly = ((scores > self.threshold_) & (extra > 0)).astype(int)
+        above_normal = X.iloc[:, min(1, X.shape[1] - 1)].values > 0      # 1-hour average above normal
+        anomaly = ((scores > self.threshold_) & above_normal).astype(int)
+        extra = self._smooth(prep["net_inflow"] - self.normal_.loc[prep["slot"], "net_inflow"].values,
+                             prep["group"], 4).values    # extra L/s, 1-hour average
         # alert = N anomalous readings in a row
         run = pd.Series(anomaly, index=df.index).groupby(prep["group"]).transform(
             lambda s: s.rolling(self.alert_after, min_periods=self.alert_after).sum())
         alert = (run >= self.alert_after).astype(int).values
         # suspected area = pressure sensor with the biggest unusual drop
         pcols = [f"P_{n}" for n in self.pressure_sensors]
-        drop = (prep[pcols] - self.normal_.loc[prep["slot"], pcols].values) / self.pressure_std_
+        normal, spread = self.normal_.loc[prep["slot"], pcols].values, self.spread_.loc[prep["slot"], pcols].values
+        drop = (prep[pcols] - normal) / spread
         area = drop.rolling(4, min_periods=1).mean().idxmin(axis=1).str[2:].values
         return pd.DataFrame({
             "anomaly_score": scores,
             "is_anomaly": anomaly,
             "leak_alert": alert,
             "extra_inflow": extra,
+            "valve_open": df["valve_open"].values,
             "suspected_node": area,
         }, index=df.index)
 
