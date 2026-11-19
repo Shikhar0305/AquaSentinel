@@ -1,0 +1,53 @@
+# Reproducible pipeline:  dvc repro
+# DVC re-runs a stage only when its code, data or params changed.
+stages:
+  simulate:
+    cmd: python -m src.simulate --mode train
+    deps:
+      - src/simulate.py
+      - src/utils.py
+    params:
+      - simulation
+      - sensors
+    outs:
+      - data/raw/sensor_data.csv
+
+  simulate_drift:
+    cmd: python -m src.simulate --mode drift
+    deps:
+      - src/simulate.py
+      - src/utils.py
+    params:
+      - simulation
+      - drift
+      - sensors
+    outs:
+      - data/raw/drift_data.csv
+
+  feature_table:
+    cmd: python -m src.feature_table
+    deps:
+      - data/raw/sensor_data.csv
+      - src/feature_table.py
+      - src/features.py
+    outs:
+      - data/features/sensor_features.parquet
+
+  train:
+    cmd: python -m src.train
+    deps:
+      - data/raw/sensor_data.csv
+      - src/train.py
+      - src/model.py
+      - src/features.py
+      - src/evaluate.py
+      - src/registry.py
+    params:
+      - model
+      - promotion
+    metrics:
+      - metrics/train_metrics.json:
+          cache: false
+    plots:
+      - reports/leak_scenario_example.png:
+          cache: false

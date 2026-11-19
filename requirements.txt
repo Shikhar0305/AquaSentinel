@@ -1,0 +1,23 @@
+# core / ML
+numpy==2.5.5
+pandas==2.2.3
+scikit-learn==1.9.1
+wntr==1.5.0
+pyyaml==6.0.3
+joblib==1.6.0
+matplotlib==3.11.2
+
+# MLOps
+mlflow==3.18.0
+evidently==0.7.23
+
+# serving + monitoring
+fastapi==0.165.0
+uvicorn==0.54.0
+pydantic==2.14.4
+prometheus-client==0.26.0
+requests==2.34.2
+
+# dashboard
+streamlit==1.67.0
+plotly==5.24.1

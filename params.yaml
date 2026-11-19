@@ -1,0 +1,58 @@
+# AquaSentinel - all tunable settings live here.
+# DVC watches this file, so changing a value and running `dvc repro`
+# re-runs only the stages that depend on it.
+
+simulation:
+  network: Net3            # EPANET example network shipped with WNTR (97 nodes, 119 links)
+  days: 3                  # length of each simulated scenario
+  warmup_hours: 24         # first day is dropped: tanks are still settling from initial levels
+  timestep_min: 15         # sensor reading interval
+  n_normal_scenarios: 12   # scenarios without any leak
+  n_leak_scenarios: 24     # scenarios with one leak injected
+  leak_area_min: 0.0005    # leak hole area in m^2 (small leaks are hard to detect)
+  leak_area_max: 0.0030
+  leak_start_hour_min: 30  # leak starts between hour 30 and 54
+  leak_start_hour_max: 54
+  demand_variation: 0.03   # +/- random change in demand per scenario
+  noise_pressure_m: 0.15   # sensor noise (std dev)
+  noise_flow_lps: 1.0
+  seed: 42
+
+drift:
+  # "summer" data: higher water demand than the training data
+  demand_multiplier: 1.30
+  n_normal_scenarios: 10
+  n_leak_scenarios: 14
+  seed: 7
+  # PSI (population stability index) per sensor. 0.25 is the textbook limit but
+  # sensor readings follow a daily cycle, so normal days already differ a bit.
+  # 0.5 kept normal test data below the limit and flagged all summer columns.
+  psi_threshold: 0.5
+  drift_share_threshold: 0.5   # retrain if >= 50% of sensor columns drifted
+  min_scenarios_for_retrain: 16 # wait until enough new data has arrived
+
+sensors:
+  pressure: ["15", "35", "123", "149", "173", "203", "247", "255"]   # junction ids
+  flow: ["10", "20", "40", "50", "60", "101", "329"]                 # pipe ids
+  # pipes leaving the 2 sources (10, 60) and the 3 tanks (20, 40, 50).
+  # their sum = total water going into the city = consumption + leaks
+  inflow: ["10", "60", "20", "40", "50"]
+
+model:
+  name: aquasentinel-leak-detector
+  n_estimators: 200
+  max_samples: 256
+  windows: [1, 4, 12]        # smoothing windows in readings: 15 min, 1 h, 3 h
+  threshold_percentile: 98.0 # anomaly threshold = 98th pct of normal training scores
+  consecutive_for_alert: 3   # raise a leak ALERT only after 3 anomalous readings in a row
+  test_size: 0.3
+  random_state: 42
+
+promotion:
+  # Champion vs challenger is compared on the same new test data.
+  # ROC-AUC is used (not F1) because a broken model that flags EVERYTHING still gets
+  # a decent F1 when leaks are common in the test set. A model that raises too many
+  # false alarms is not usable by operators, so it gets a score of 0.
+  metric: roc_auc
+  max_false_alarm_rate: 0.05
+  min_improvement: -0.01     # new model may be at most 0.01 worse and still replace

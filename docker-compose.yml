@@ -1,0 +1,101 @@
+# Full stack:  docker compose up -d --build
+#   API        http://localhost:8000/docs
+#   Dashboard  http://localhost:8501
+#   MLflow     http://localhost:5000
+#   Prometheus http://localhost:9090
+#   Grafana    http://localhost:3000   (admin / admin)
+#
+# Train the first model inside the stack:
+#   docker compose run --rm trainer
+
+x-app: &app
+  build: .
+  image: aquasentinel:latest
+  volumes:
+    - ./data:/app/data
+    - ./models:/app/models
+    - ./logs:/app/logs
+    - ./metrics:/app/metrics
+    - ./reports:/app/reports
+  environment: &app-env
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    AQUA_ADMIN_KEY: ${AQUA_ADMIN_KEY:-admin-dev-key}
+    AQUA_OPERATOR_KEY: ${AQUA_OPERATOR_KEY:-operator-dev-key}
+    AQUA_VIEWER_KEY: ${AQUA_VIEWER_KEY:-viewer-dev-key}
+
+services:
+  mlflow:
+    <<: *app
+    container_name: aquasentinel-mlflow
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////app/mlflow/mlflow.db
+      --artifacts-destination /app/mlflow/artifacts
+      --allowed-hosts "mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1:5000"
+    volumes:
+      - ./mlflow_data:/app/mlflow
+    ports: ["5000:5000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:5000/health"]
+      interval: 10s
+      retries: 5
+
+  trainer:
+    <<: *app
+    profiles: ["jobs"]
+    depends_on:
+      mlflow: {condition: service_healthy}
+    command: sh -c "python -m src.simulate --mode train && python -m src.simulate --mode drift && python -m src.train"
+
+  retrain:
+    <<: *app
+    profiles: ["jobs"]
+    depends_on:
+      mlflow: {condition: service_healthy}
+    command: python -m src.retrain
+
+  api:
+    <<: *app
+    container_name: aquasentinel-api
+    restart: unless-stopped
+    depends_on:
+      mlflow: {condition: service_healthy}
+    environment:
+      <<: *app-env
+      SHADOW_MODE: ${SHADOW_MODE:-true}
+      CANARY_PERCENT: ${CANARY_PERCENT:-0}
+      ENABLE_CHAOS: ${ENABLE_CHAOS:-false}
+    ports: ["8000:8000"]
+
+  dashboard:
+    <<: *app
+    container_name: aquasentinel-dashboard
+    depends_on: [api]
+    environment:
+      API_URL: http://api:8000
+      DASHBOARD_API_KEY: ${AQUA_OPERATOR_KEY:-operator-dev-key}
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    healthcheck:
+      disable: true
+    ports: ["8501:8501"]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: aquasentinel-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [api]
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: aquasentinel-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/aquasentinel.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]

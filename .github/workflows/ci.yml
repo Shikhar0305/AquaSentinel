@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: flake8 .
+
+      - name: Unit tests
+        run: pytest -q
+
+      - name: Smoke test the full pipeline (small data)
+        run: |
+          python - <<'PY'
+          import yaml
+          p = yaml.safe_load(open("params.yaml"))
+          p["simulation"]["n_normal_scenarios"] = 4
+          p["simulation"]["n_leak_scenarios"] = 6
+          yaml.safe_dump(p, open("params.yaml", "w"), sort_keys=False)
+          PY
+          python -m src.simulate --mode train
+          python -m src.train
+          python -c "import json; m=json.load(open('metrics/train_metrics.json')); print(m); assert m['roc_auc'] > 0.7"
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: |
+            metrics/
+            reports/
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t aquasentinel:${{ github.sha }} .
+      - name: Check the image starts
+        run: |
+          docker run --rm aquasentinel:${{ github.sha }} python -c "import api.main, src.train; print('imports ok')"
