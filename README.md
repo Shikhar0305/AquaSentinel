@@ -156,7 +156,7 @@ While supply is off, water loss is estimated as `recent inflow − 16 L/s` (norm
 
 ## 6. Testing
 
-`tests/test_api.py` covers the root and health endpoints, prediction, no-leak and critical-leak analysis, the real champion model telling a leak from a normal zone, no loss estimate during supply hours, and invalid input (too few readings, out-of-range values).
+`tests/test_api.py` covers the root and health endpoints, prediction, no-leak and critical-leak analysis, the real champion model telling a leak from a normal zone, no loss estimate during supply hours, and invalid input (too few readings, out-of-range values). `tests/test_monitor.py` covers incoming-batch schema and duplicate-record validation.
 
 ```bash
 python -m pytest tests/ -v
@@ -186,9 +186,13 @@ The image is published as `ghcr.io/shikhar0305/aquasentinel` with the tags `late
 ```text
 AquaSentinel/
 ├── .github/workflows/ci.yml   CI/CD pipeline
+├── data/incoming/              labelled batch for monitoring and retraining
 ├── data/processed/            simulated zone inflow dataset
 ├── image/                     API and MLflow screenshots
 ├── models/champion.joblib     exported champion model
+├── models/candidate.joblib    candidate from monitoring workflow
+├── reports/                   evaluation report and quality-gate decision
+├── monitor.py                 evaluate, retrain and quality-gate workflow
 ├── src/
 │   ├── data_loader.py         WNTR simulation and dataset
 │   ├── inspect_data.py        dataset checks
@@ -196,7 +200,8 @@ AquaSentinel/
 │   ├── inference.py           loads the champion and predicts
 │   ├── leak_analysis.py       status rules and water loss
 │   └── api.py                 FastAPI endpoints
-├── tests/test_api.py          automated tests
+├── tests/test_api.py           API and leak-analysis tests
+├── tests/test_monitor.py      monitoring validation tests
 ├── main.py                    runs the full ML pipeline
 ├── train.py                   trains, compares and registers models
 ├── Dockerfile
@@ -219,6 +224,7 @@ pip install -r requirements.txt
 | Task | Command |
 |---|---|
 | Run the ML pipeline (simulate, train, register) | `python main.py` |
+| Run monitoring and retraining | `python monitor.py` |
 | MLflow UI | `mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000` |
 | Start the API | `uvicorn src.api:app --reload` → http://127.0.0.1:8000/docs |
 | Run tests | `python -m pytest tests/ -v` |
@@ -227,9 +233,25 @@ pip install -r requirements.txt
 
 The champion model is already in `models/`, so the API runs without retraining.
 
+## 8. Monitoring and Retraining
+
+`python monitor.py` implements the assessment workflow. It loads
+`data/incoming/new_batch.csv` or creates a deterministic labelled demo batch,
+validates required columns, missing values, duplicate records, dataset size, and
+target distribution, then evaluates the champion with accuracy, precision, recall,
+and F1-score. It combines the existing data with the batch, reuses the existing
+feature pipeline, and saves a separate `models/candidate.joblib` artifact.
+
+The quality gate uses F1 as its primary metric because it balances missed leaks
+(recall) and false alarms (precision). The decision and both metric sets are saved
+to `reports/quality_gate.json` and `reports/evaluation_report.json`. A candidate
+must meet or exceed the champion F1 to be eligible for promotion, and the champion
+is never overwritten automatically. A candidate MLflow run is recorded when MLflow
+is installed.
+
 ---
 
-## Tech Stack
+## 9. Tech Stack
 
 Python 3.12 · WNTR (EPANET) · Pandas · NumPy · Scikit-learn · MLflow · Joblib · FastAPI · Pydantic · Pytest · Docker · GitHub Actions · GitHub Container Registry
 

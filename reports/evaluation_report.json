@@ -1,0 +1,43 @@
+{
+  "incoming_batch": {
+    "path": "data/incoming/new_batch.csv",
+    "rows": 1351,
+    "scenarios": 7,
+    "target_distribution": {
+      "0": 722,
+      "1": 629
+    }
+  },
+  "validation": "passed",
+  "evaluation": {
+    "accuracy": 0.9992150706436421,
+    "precision": 1.0,
+    "recall": 0.9984101748807631,
+    "f1": 0.9992044550517104
+  },
+  "retraining": {
+    "combined_rows": 6552,
+    "candidate_artifact": "models/candidate.joblib",
+    "mlflow_run_id": "09c101c5e2a042fba1bad1d7ab01447f"
+  },
+  "quality_gate": {
+    "decision": "retain_champion",
+    "metric": "f1",
+    "rule": "candidate F1 must be greater than or equal to champion F1",
+    "champion_model": "models/champion.joblib",
+    "candidate_model": "models/candidate.joblib",
+    "champion_metrics": {
+      "accuracy": 0.9992150706436421,
+      "precision": 1.0,
+      "recall": 0.9984101748807631,
+      "f1": 0.9992044550517104
+    },
+    "candidate_metrics": {
+      "accuracy": 0.9976452119309263,
+      "precision": 1.0,
+      "recall": 0.9952305246422893,
+      "f1": 0.9976095617529881
+    },
+    "champion_overwritten": false
+  }
+}
